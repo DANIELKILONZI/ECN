@@ -28,7 +28,10 @@ Usage:
 
 import datetime
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ecn.persistence import AuditStore
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +121,25 @@ class AuditLog:
     Thread-safe (single-threaded asyncio) append-only audit log.
 
     All ECN rounds are recorded here.  Consumers read via the query methods.
+
+    Parameters
+    ----------
+    store : AuditStore, optional
+        When provided, every event is persisted to the store and existing
+        events are loaded from it at construction time.  Set ``ECN_DB_PATH``
+        to enable automatic store creation via ``ecn.persistence.open_from_env``.
+    tenant_id : str
+        Tenant scope used when writing to / reading from *store*.  Empty
+        string (default) means the global (non-tenant) audit log.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: "Optional[AuditStore]" = None, tenant_id: str = "") -> None:
+        self._store = store
+        self._tenant_id = tenant_id
         self._events: List[AuditEvent] = []
+        # Reload persisted events so in-memory state is consistent after restart
+        if store is not None:
+            self._load_from_store()
 
     # ------------------------------------------------------------------
     # Write path
@@ -180,7 +198,42 @@ class AuditLog:
             vote_counts=dict(consensus_result.vote_counts),
         )
         self._events.append(event)
+        # Persist to durable store when configured
+        if self._store is not None:
+            self._store.append(event.to_dict(), tenant_id=self._tenant_id)
         return event
+
+    # ------------------------------------------------------------------
+    # Reload helper (called in __init__ when a store is provided)
+    # ------------------------------------------------------------------
+
+    def _load_from_store(self) -> None:
+        """Reconstruct in-memory events from persistent store on startup."""
+        raw_events = self._store.load_all(tenant_id=self._tenant_id)
+        for d in raw_events:
+            votes = [
+                NodeVote(
+                    node_id=v["node_id"],
+                    state_hash=v["state_hash"],
+                    signature=v.get("signature"),
+                    status=v["status"],
+                )
+                for v in d.get("votes", [])
+            ]
+            self._events.append(
+                AuditEvent(
+                    round_id=d["round_id"],
+                    timestamp=d["timestamp"],
+                    transaction=d["transaction"],
+                    votes=votes,
+                    agreed_hash=d.get("agreed_hash"),
+                    consensus_reached=d.get("consensus_reached", False),
+                    honest_nodes=d.get("honest_nodes", []),
+                    faulty_nodes=d.get("faulty_nodes", []),
+                    invalid_sig_nodes=d.get("invalid_sig_nodes", []),
+                    vote_counts=d.get("vote_counts", {}),
+                )
+            )
 
     # ------------------------------------------------------------------
     # Read path

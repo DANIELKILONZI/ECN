@@ -373,6 +373,13 @@ async def tenant_submit_transaction(tenant_id: str, body: TenantTransactionReque
     if event is None:
         raise HTTPException(status_code=500, detail="Audit event not recorded")
 
+    # Record usage for SaaS billing
+    try:
+        from ecn.billing import get_tracker
+        get_tracker().record_round(tenant_id)
+    except RuntimeError:
+        pass  # billing tracker not initialised (e.g. in unit tests)
+
     # Dispatch tenant webhooks in background
     asyncio.create_task(tenant.webhook_registry.dispatch(event))
 

@@ -15,6 +15,25 @@ This demonstrates real node-to-node communication over TCP while keeping the
 demo self-contained (no external processes required).  In production each
 NodeServer would run in its own process or container.
 
+Network interface binding
+-------------------------
+Set ``ECN_NODE_HOST=0.0.0.0`` (or any routable interface) so node servers
+are reachable across pods/machines.  The default remains ``127.0.0.1`` for
+backward compatibility with single-host deployments and tests.
+
+Quorum configuration
+--------------------
+``ECN_QUORUM_THRESHOLD`` (float, 0 < t ≤ 1.0, default 0.51) controls the
+minimum fraction of responding nodes that must agree for consensus to be
+marked as reached.  Use 0.67 for classical 1/3 BFT tolerance.
+
+Partial-quorum acceptance
+--------------------------
+``ECN_QUORUM_MIN_RESPONSES`` (int, default 1) — if fewer than this many
+nodes respond, the broadcast raises ``InsufficientQuorumError`` instead of
+silently proceeding with a single result.  Set to ``ceil(n * quorum_threshold)``
+for strict enforcement.
+
 Usage:
     network = await P2PNetwork.create(
         node_configs=[
@@ -30,11 +49,13 @@ Usage:
 import asyncio
 import json
 import logging
+import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 from ecn.node_server import NodeServer
 from ecn.node import NodeResult
-from ecn.consensus import ConsensusResult, run_consensus
+from ecn.consensus import ConsensusResult, run_consensus, DEFAULT_QUORUM_THRESHOLD
 from ecn.crypto import public_key_from_hex, verify_result, SignedResult
 from ecn.execution_engine import Transaction, State
 
@@ -43,6 +64,24 @@ logger = logging.getLogger(__name__)
 # Short timeout for local TCP connections (seconds)
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 10.0
+
+
+class InsufficientQuorumError(Exception):
+    """Raised when fewer nodes respond than the configured minimum quorum."""
+
+
+def _get_quorum_threshold() -> float:
+    """Read ECN_QUORUM_THRESHOLD from env (falls back to DEFAULT_QUORUM_THRESHOLD)."""
+    raw = os.environ.get("ECN_QUORUM_THRESHOLD", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if 0 < val <= 1.0:
+                return val
+            logger.warning("ECN_QUORUM_THRESHOLD=%r out of range (0,1] — using default", raw)
+        except ValueError:
+            logger.warning("ECN_QUORUM_THRESHOLD=%r is not a float — using default", raw)
+    return DEFAULT_QUORUM_THRESHOLD
 
 
 class P2PNetwork:
@@ -59,12 +98,28 @@ class P2PNetwork:
         Pre-started NodeServer instances.
     verbose : bool
         When *True*, print results to stdout after each broadcast.
+    quorum_threshold : float
+        Minimum fraction of responding nodes that must agree for consensus
+        to be reached.  Reads from ``ECN_QUORUM_THRESHOLD`` env var when
+        not explicitly provided.
+    min_responses : int
+        Minimum number of nodes that must respond.  Defaults to 1.
+        Set to ``math.ceil(n * quorum_threshold)`` for strict enforcement.
     """
 
-    def __init__(self, servers: List[NodeServer], verbose: bool = True, audit_log=None) -> None:
+    def __init__(
+        self,
+        servers: List[NodeServer],
+        verbose: bool = True,
+        audit_log=None,
+        quorum_threshold: Optional[float] = None,
+        min_responses: Optional[int] = None,
+    ) -> None:
         self._servers = servers
         self.verbose = verbose
         self._audit_log = audit_log
+        self._quorum_threshold = quorum_threshold if quorum_threshold is not None else _get_quorum_threshold()
+        self._min_responses = min_responses if min_responses is not None else 1
         # Build node_id -> public_key mapping for signature verification
         self._public_keys: Dict[str, object] = {
             s.node_id: s.public_key for s in servers
@@ -83,6 +138,8 @@ class P2PNetwork:
         base_port: int = 19000,
         verbose: bool = True,
         audit_log=None,
+        quorum_threshold: Optional[float] = None,
+        min_responses: Optional[int] = None,
     ) -> "P2PNetwork":
         """
         Create and start all node servers, then return a connected P2PNetwork.
@@ -94,22 +151,30 @@ class P2PNetwork:
               - ``node_id`` (str, required)
               - ``port`` (int, optional — auto-assigned if omitted)
               - ``malicious`` (bool, optional)
+              - ``host`` (str, optional — defaults to ECN_NODE_HOST env var or 127.0.0.1)
         initial_state : State
         base_port : int
             Starting port for auto-assignment.
         verbose : bool
         audit_log : AuditLog, optional
             When provided, every round is recorded as an AuditEvent.
+        quorum_threshold : float, optional
+            Override the consensus quorum threshold for this network.
+        min_responses : int, optional
+            Override the minimum response count for this network.
         """
+        node_host = os.environ.get("ECN_NODE_HOST", "127.0.0.1").strip()
         servers: List[NodeServer] = []
         for i, cfg in enumerate(node_configs):
             node_id = cfg["node_id"]
             port = cfg.get("port", base_port + i)
             malicious = cfg.get("malicious", False)
+            host = cfg.get("host", node_host)
             server = NodeServer(
                 node_id=node_id,
                 initial_state=initial_state,
                 port=port,
+                host=host,
                 malicious=malicious,
             )
             await server.start()
@@ -117,7 +182,13 @@ class P2PNetwork:
 
         # Brief pause so all servers are ready to accept connections
         await asyncio.sleep(0.05)
-        return cls(servers=servers, verbose=verbose, audit_log=audit_log)
+        return cls(
+            servers=servers,
+            verbose=verbose,
+            audit_log=audit_log,
+            quorum_threshold=quorum_threshold,
+            min_responses=min_responses,
+        )
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -130,6 +201,11 @@ class P2PNetwork:
         Send *tx* to every node server over real TCP, collect signed results,
         verify signatures, and run consensus.
 
+        Raises
+        ------
+        InsufficientQuorumError
+            When fewer than ``min_responses`` nodes respond.
+
         Returns
         -------
         (results, consensus_result)
@@ -138,13 +214,33 @@ class P2PNetwork:
         raw_responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: List[NodeResult] = []
+        failed_nodes: List[str] = []
         for server, resp in zip(self._servers, raw_responses):
             if isinstance(resp, Exception):
                 logger.warning("Server %s failed: %s", server.node_id, resp)
+                failed_nodes.append(server.node_id)
                 continue
             results.append(resp)
 
-        consensus_result = run_consensus(results, public_keys=self._public_keys)
+        if failed_nodes:
+            logger.info(
+                "Partial-quorum round: %d/%d nodes responded (non-responding: %s)",
+                len(results),
+                len(self._servers),
+                failed_nodes,
+            )
+
+        if len(results) < self._min_responses:
+            raise InsufficientQuorumError(
+                f"Only {len(results)}/{len(self._servers)} nodes responded "
+                f"(min_responses={self._min_responses})"
+            )
+
+        consensus_result = run_consensus(
+            results,
+            public_keys=self._public_keys,
+            quorum_threshold=self._quorum_threshold,
+        )
         self._history.append((tx, results, consensus_result))
 
         if self._audit_log is not None:

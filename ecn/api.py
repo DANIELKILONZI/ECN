@@ -102,7 +102,16 @@ from pydantic import BaseModel, HttpUrl
 
 from ecn.audit import AuditLog
 from ecn.auth import init_registry, require_admin, require_role, ROLE_ADMIN, ROLE_SUBMITTER
+from ecn.billing import (
+    BillingTracker,
+    StripeWebhookPayload,
+    StripeWebhookResponse,
+    UsageResponse,
+    handle_stripe_event,
+    init_tracker,
+)
 from ecn.p2p_network import P2PNetwork
+from ecn.persistence import open_from_env
 from ecn.stream import EventBus, sse_generator, TOPIC_TRANSACTIONS, TOPIC_FAULTS
 from ecn.tenant import init_tenant_registry, router as tenant_router
 from ecn.use_cases.supply_chain import register_supply_chain_handlers, make_initial_state
@@ -146,9 +155,12 @@ async def lifespan(app: FastAPI):
     global _network, _audit_log, _webhook_registry, _event_bus
     _webhook_registry = WebhookRegistry()
     _event_bus = EventBus()
-    init_registry()
+    # Open persistent stores (no-op when ECN_DB_PATH is not set)
+    stores = open_from_env()
+    init_registry(store=stores["key_store"])
+    init_tracker(store=stores["billing_store"])
     init_tenant_registry()
-    _audit_log = AuditLog()
+    _audit_log = AuditLog(store=stores["audit_store"])
     _network = await P2PNetwork.create(
         node_configs=_NODE_CONFIGS,
         initial_state=make_initial_state(_DEFAULT_PRODUCT_IDS),
@@ -909,6 +921,79 @@ async def revoke_api_key(key_id: str, _auth=Depends(require_admin())):
         raise HTTPException(status_code=503, detail=str(exc))
     if not registry.revoke(key_id):
         raise HTTPException(status_code=404, detail=f"Key {key_id!r} not found")
+
+
+# ---------------------------------------------------------------------------
+# Routes — Billing / Usage metering
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/tenants/{tenant_id}/usage",
+    response_model=UsageResponse,
+    summary="SaaS usage metering for this tenant",
+    tags=["Billing"],
+)
+async def tenant_usage(tenant_id: str):
+    """
+    Return the number of consensus rounds executed by this tenant in the
+    current billing period and all previous periods.
+
+    This endpoint powers the SaaS billing model:
+    - ``current_period`` — the active billing period key (e.g. ``"2026-04"``)
+    - ``round_count``    — rounds executed in the current period
+    - ``all_periods``    — full billing history (period → count)
+
+    Wire ``round_count`` into your Stripe metered billing subscription to
+    charge per consensus round.
+
+    Set ``ECN_BILLING_PERIOD=daily`` for per-day buckets (default: monthly).
+    """
+    # Verify the tenant exists
+    from ecn.tenant import get_tenant_registry
+    registry = get_tenant_registry()
+    if registry.get(tenant_id) is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id!r} not found")
+
+    from ecn.billing import get_tracker
+    try:
+        tracker = get_tracker()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    usage = tracker.get_usage(tenant_id)
+    return UsageResponse(**usage)
+
+
+@app.post(
+    "/billing/stripe-webhook",
+    response_model=StripeWebhookResponse,
+    status_code=200,
+    summary="Stripe payment event receiver",
+    tags=["Billing"],
+)
+async def stripe_webhook(payload: StripeWebhookPayload):
+    """
+    Receive and process Stripe payment events.
+
+    Stripe sends ``POST`` notifications to this URL for subscription events.
+    Configure your Stripe webhook in the Stripe Dashboard to point at:
+
+        https://your-ecn-host/billing/stripe-webhook
+
+    **Supported event types:**
+    - ``invoice.payment_succeeded`` — payment confirmed
+    - ``invoice.payment_failed``    — payment failed, action required
+    - ``customer.subscription.deleted`` — subscription cancelled
+
+    To link Stripe customers to ECN tenants, set
+    ``metadata.ecn_tenant_id`` on your Stripe customer or subscription object.
+
+    **Stripe signature validation** is intentionally omitted here for
+    portability (no Stripe SDK dependency).  In production, verify the
+    ``Stripe-Signature`` header using your Stripe webhook secret before
+    calling this route.
+    """
+    return handle_stripe_event(payload)
 
 
 # ---------------------------------------------------------------------------

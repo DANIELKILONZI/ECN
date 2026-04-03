@@ -10,15 +10,36 @@ Algorithm:
 - Any node whose hash differs from the winning hash is flagged as faulty.
 - Any node whose signature fails verification is flagged as faulty immediately.
 
+Quorum threshold
+----------------
+The ``quorum_threshold`` parameter (0 < threshold ≤ 1.0, default 0.51) sets
+the minimum fraction of *verified* responses that must agree on the winning
+hash for ``ConsensusResult.consensus_reached`` to be ``True``.
+
+BFT guarantees with configurable quorum
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With *n* total nodes and threshold *t*:
+- The network tolerates up to ``floor(n * (1 - t))`` faulty or non-responding
+  nodes while still reaching consensus.
+- Classical BFT (⌊(n-1)/3⌋ Byzantine tolerance) corresponds to t ≈ 0.67.
+- The default (t = 0.51) tolerates up to ⌊n/2⌋ - 1 failures.
+
+Examples:
+  5 nodes, t=0.51 → need 3/5 agreement, tolerates 2 failures
+  5 nodes, t=0.67 → need 4/5 agreement, tolerates 1 failure
+  7 nodes, t=0.67 → need 5/7 agreement, tolerates 2 failures
+
 This is intentionally simple (plurality voting) so the prototype stays clear.
-For production use, a threshold such as ⌊(n-1)/3⌋ Byzantine fault tolerance
-could be layered on top.
 """
 
 from collections import Counter
 from typing import Dict, List, Optional
 
 from ecn.node import NodeResult
+
+
+# Default quorum threshold — strict majority (just over 50%)
+DEFAULT_QUORUM_THRESHOLD = 0.51
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +64,12 @@ class ConsensusResult:
         whose signature failed verification.
     total_nodes : int
     consensus_reached : bool
-        ``True`` when ``agreed_hash`` received a strict majority (> 50 %).
+        ``True`` when ``agreed_hash`` received votes meeting or exceeding
+        ``quorum_threshold`` (default: strict majority > 50%).
     invalid_sig_nodes : list[str]
         Subset of faulty_nodes that were rejected due to bad signatures.
+    quorum_threshold : float
+        The threshold used for this round (fraction of verified responders).
     """
 
     def __init__(
@@ -55,6 +79,7 @@ class ConsensusResult:
         honest_nodes: List[str],
         faulty_nodes: List[str],
         invalid_sig_nodes: Optional[List[str]] = None,
+        quorum_threshold: float = DEFAULT_QUORUM_THRESHOLD,
     ) -> None:
         self.agreed_hash = agreed_hash
         self.vote_counts = vote_counts
@@ -62,11 +87,12 @@ class ConsensusResult:
         self.faulty_nodes = faulty_nodes
         self.invalid_sig_nodes = invalid_sig_nodes or []
         self.total_nodes = len(honest_nodes) + len(faulty_nodes)
-        # Strict majority: more than half of all nodes agree
-        if agreed_hash is not None and self.total_nodes > 0:
-            self.consensus_reached = (
-                vote_counts.get(agreed_hash, 0) > self.total_nodes // 2
-            )
+        self.quorum_threshold = quorum_threshold
+        # Quorum check: agreed_hash votes / total verified responders >= threshold
+        total_verified = sum(vote_counts.values()) if vote_counts else 0
+        if agreed_hash is not None and total_verified > 0:
+            agree_fraction = vote_counts.get(agreed_hash, 0) / total_verified
+            self.consensus_reached = agree_fraction >= quorum_threshold
         else:
             self.consensus_reached = False
 
@@ -86,6 +112,7 @@ class ConsensusResult:
 def run_consensus(
     results: List[NodeResult],
     public_keys: Optional[Dict[str, object]] = None,
+    quorum_threshold: float = DEFAULT_QUORUM_THRESHOLD,
 ) -> ConsensusResult:
     """
     Perform a consensus round over a list of node results.
@@ -99,6 +126,10 @@ def run_consensus(
         result's signature is verified before it is counted.  Results with
         missing or invalid signatures are immediately flagged as faulty and
         excluded from the vote tally.
+    quorum_threshold : float
+        Minimum fraction of verified responders that must agree on the
+        winning hash for consensus to be reached.  Defaults to 0.51 (strict
+        majority).  Use 0.67 for classical 1/3 BFT tolerance.
 
     Returns
     -------
@@ -110,6 +141,7 @@ def run_consensus(
             vote_counts={},
             honest_nodes=[],
             faulty_nodes=[],
+            quorum_threshold=quorum_threshold,
         )
 
     # Step 1: signature verification (when keys are supplied)
@@ -141,6 +173,7 @@ def run_consensus(
             honest_nodes=[],
             faulty_nodes=[r.node_id for r in results],
             invalid_sig_nodes=invalid_sig_nodes,
+            quorum_threshold=quorum_threshold,
         )
 
     # Step 2: count votes per hash (only verified results)
@@ -159,6 +192,7 @@ def run_consensus(
         honest_nodes=honest_nodes,
         faulty_nodes=all_faulty,
         invalid_sig_nodes=invalid_sig_nodes,
+        quorum_threshold=quorum_threshold,
     )
 
 

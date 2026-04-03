@@ -62,9 +62,12 @@ import os
 import secrets
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from fastapi import Header, HTTPException
+
+if TYPE_CHECKING:
+    from ecn.persistence import KeyStore
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +103,22 @@ class ApiKey:
 
 class ApiKeyRegistry:
     """
-    In-memory API key registry.
+    API key registry with optional durable persistence.
+
+    When *store* is ``None`` (the default) the registry is in-memory only
+    (original behaviour).  Pass a ``KeyStore`` to persist keys across
+    restarts — see ``ecn.persistence.open_from_env``.
 
     Thread-safety: single-threaded asyncio — no locking needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: "Optional[KeyStore]" = None) -> None:
+        self._store = store
         self._keys: Dict[str, ApiKey] = {}  # key_id → ApiKey
         self._lookup: Dict[str, ApiKey] = {}  # secret_value → ApiKey
+        # Reload persisted keys so in-memory state is consistent after restart
+        if store is not None:
+            self._load_from_store()
 
     def issue(
         self,
@@ -146,6 +157,14 @@ class ApiKeyRegistry:
         )
         self._keys[api_key.key_id] = api_key
         self._lookup[api_key.key] = api_key
+        if self._store is not None:
+            self._store.save_key(api_key.key_id, {
+                "key_id": api_key.key_id,
+                "key": api_key.key,
+                "role": api_key.role,
+                "description": api_key.description,
+                "tenant_id": api_key.tenant_id,
+            })
         return api_key
 
     def revoke(self, key_id: str) -> bool:
@@ -154,6 +173,8 @@ class ApiKeyRegistry:
         if api_key is None:
             return False
         self._lookup.pop(api_key.key, None)
+        if self._store is not None:
+            self._store.delete_key(key_id)
         return True
 
     def lookup(self, secret: str) -> Optional[ApiKey]:
@@ -175,6 +196,19 @@ class ApiKeyRegistry:
     def __len__(self) -> int:
         return len(self._keys)
 
+    def _load_from_store(self) -> None:
+        """Reconstruct in-memory state from persistent store on startup."""
+        for d in self._store.load_all():
+            api_key = ApiKey(
+                key_id=d["key_id"],
+                key=d["key"],
+                role=d["role"],
+                description=d.get("description", ""),
+                tenant_id=d.get("tenant_id"),
+            )
+            self._keys[api_key.key_id] = api_key
+            self._lookup[api_key.key] = api_key
+
 
 # ---------------------------------------------------------------------------
 # Module-level registry singleton
@@ -191,9 +225,16 @@ def get_registry() -> ApiKeyRegistry:
     return _registry
 
 
-def init_registry() -> ApiKeyRegistry:
+def init_registry(store: "Optional[KeyStore]" = None) -> ApiKeyRegistry:
     """
     Initialise the global ApiKeyRegistry.
+
+    Parameters
+    ----------
+    store : KeyStore, optional
+        Persistent key store.  When ``None`` the registry is in-memory only.
+        Call ``ecn.persistence.open_from_env()`` to get a store driven by
+        the ``ECN_DB_PATH`` environment variable.
 
     If ``ECN_AUTH_ENABLED`` is set, bootstraps an admin key from
     ``ECN_ADMIN_KEY`` (or generates and logs a random one).
@@ -201,7 +242,7 @@ def init_registry() -> ApiKeyRegistry:
     Returns the registry regardless of whether auth is enabled.
     """
     global _registry
-    _registry = ApiKeyRegistry()
+    _registry = ApiKeyRegistry(store=store)
 
     if _is_auth_enabled():
         admin_secret = os.environ.get("ECN_ADMIN_KEY", "").strip()
@@ -222,13 +263,17 @@ def init_registry() -> ApiKeyRegistry:
                 "generated a temporary bootstrap key (see stderr for value). "
                 "Set ECN_ADMIN_KEY to use a fixed key."
             )
-        admin_key = _registry.issue(
-            role=ROLE_ADMIN,
-            description="bootstrap admin",
-            key_id="admin-bootstrap",
-            secret=admin_secret,
-        )
-        logger.info("Auth enabled. Admin key_id=%s", admin_key.key_id)
+        # Only issue bootstrap admin if it doesn't already exist in the store
+        if _registry.lookup(admin_secret) is None:
+            admin_key = _registry.issue(
+                role=ROLE_ADMIN,
+                description="bootstrap admin",
+                key_id="admin-bootstrap",
+                secret=admin_secret,
+            )
+            logger.info("Auth enabled. Admin key_id=%s", admin_key.key_id)
+        else:
+            logger.info("Auth enabled. Bootstrap admin key already present in store.")
 
     return _registry
 
@@ -250,6 +295,18 @@ def require_role(*allowed_roles: str):
     Returns a dependency function that:
     - Passes immediately when auth is disabled (backward compatible).
     - Validates ``X-API-Key`` header and checks the role when auth is enabled.
+    - Also accepts ``Authorization: Bearer <jwt>`` as an alternative to
+      ``X-API-Key`` for OAuth2 / SSO enterprise integrations.
+
+    JWT configuration
+    -----------------
+    ``ECN_JWT_SECRET``
+        HS256 shared secret for validating Bearer tokens.  The JWT payload
+        must contain a ``"role"`` claim whose value is one of the ECN roles.
+    ``ECN_JWT_AUDIENCE``
+        Expected ``aud`` claim (optional — skipped if not set).
+    ``ECN_JWT_ISSUER``
+        Expected ``iss`` claim (optional — skipped if not set).
 
     Usage::
 
@@ -257,15 +314,31 @@ def require_role(*allowed_roles: str):
         async def submit(_, _auth=Depends(require_role("submitter", "admin"))):
             ...
     """
-    async def _check(x_api_key: Optional[str] = Header(default=None)):
+    async def _check(
+        x_api_key: Optional[str] = Header(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ):
         if not _is_auth_enabled():
             return  # auth disabled — all requests pass
         if _registry is None:
             raise HTTPException(status_code=503, detail="Auth registry not initialised")
+
+        # --- Bearer JWT (OAuth2 / SSO) -----------------------------------
+        if isinstance(authorization, str) and authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+            role = _verify_jwt_and_get_role(token)
+            if role not in allowed_roles:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"JWT role {role!r} is not authorised. Required: {list(allowed_roles)}",
+                )
+            return
+
+        # --- API Key -----------------------------------------------------
         if not x_api_key:
             raise HTTPException(
                 status_code=401,
-                detail="Missing X-API-Key header",
+                detail="Missing authentication: provide X-API-Key or Authorization: Bearer <jwt>",
                 headers={"WWW-Authenticate": "ApiKey"},
             )
         api_key = _registry.lookup(x_api_key)
@@ -279,6 +352,89 @@ def require_role(*allowed_roles: str):
             )
 
     return _check
+
+
+# ---------------------------------------------------------------------------
+# JWT HS256 validation (no external dependency — uses stdlib hmac + hashlib)
+# ---------------------------------------------------------------------------
+
+def _verify_jwt_and_get_role(token: str) -> str:
+    """
+    Validate an HS256 JWT and return the ECN role from its ``role`` claim.
+
+    Configuration via environment variables:
+      ``ECN_JWT_SECRET``    — required; HS256 signing secret
+      ``ECN_JWT_ISSUER``    — optional expected ``iss`` claim
+      ``ECN_JWT_AUDIENCE``  — optional expected ``aud`` claim
+
+    Raises ``HTTPException(401)`` on any validation failure.
+    """
+    import base64
+    import hashlib
+    import hmac
+    import json as _json
+    import time
+
+    jwt_secret = os.environ.get("ECN_JWT_SECRET", "").strip()
+    if not jwt_secret:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token authentication is not configured (ECN_JWT_SECRET not set)",
+        )
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Malformed Bearer token")
+
+    header_b64, payload_b64, sig_b64 = parts
+
+    # Verify HS256 signature
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(jwt_secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    try:
+        actual_sig = base64.urlsafe_b64decode(
+            sig_b64 + "=" * (-len(sig_b64) % 4)
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Bearer token signature encoding")
+    if not hmac.compare_digest(expected_sig, actual_sig):
+        raise HTTPException(status_code=401, detail="Invalid Bearer token signature")
+
+    # Decode payload
+    try:
+        payload_bytes = base64.urlsafe_b64decode(
+            payload_b64 + "=" * (-len(payload_b64) % 4)
+        )
+        claims = _json.loads(payload_bytes)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Bearer token payload")
+
+    # Validate standard claims
+    now = time.time()
+    if "exp" in claims and claims["exp"] < now:
+        raise HTTPException(status_code=401, detail="Bearer token has expired")
+    if "nbf" in claims and claims["nbf"] > now:
+        raise HTTPException(status_code=401, detail="Bearer token not yet valid")
+
+    expected_iss = os.environ.get("ECN_JWT_ISSUER", "").strip()
+    if expected_iss and claims.get("iss") != expected_iss:
+        raise HTTPException(status_code=401, detail="Bearer token issuer mismatch")
+
+    expected_aud = os.environ.get("ECN_JWT_AUDIENCE", "").strip()
+    if expected_aud:
+        aud = claims.get("aud", "")
+        aud_list = aud if isinstance(aud, list) else [aud]
+        if expected_aud not in aud_list:
+            raise HTTPException(status_code=401, detail="Bearer token audience mismatch")
+
+    # Extract ECN role
+    role = claims.get("role") or claims.get("ecn_role")
+    if not role or role not in ALL_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Bearer token missing valid 'role' claim. Valid roles: {sorted(ALL_ROLES)}",
+        )
+    return role
 
 
 def require_admin():

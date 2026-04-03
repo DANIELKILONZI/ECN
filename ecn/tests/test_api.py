@@ -236,3 +236,49 @@ class TestAuditReplay:
             assert "consensus_reached" in entry
             assert "fault_detected" in entry
             assert "faulty_nodes" in entry
+
+
+# ---------------------------------------------------------------------------
+# Webhook endpoints
+# ---------------------------------------------------------------------------
+
+class TestWebhooks:
+    def test_subscribe_returns_201(self, client):
+        resp = client.post("/webhooks", json={"url": "http://example.com/hook", "events": []})
+        assert resp.status_code == 201
+
+    def test_subscribe_response_fields(self, client):
+        resp = client.post("/webhooks", json={"url": "http://example.com/hook", "events": ["fault"]})
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "webhook_id" in data
+        assert data["url"] == "http://example.com/hook"
+        assert data["events"] == ["fault"]
+        assert "message" in data
+
+    def test_list_webhooks(self, client):
+        # Subscribe first to ensure at least one entry
+        client.post("/webhooks", json={"url": "http://example.com/list-test", "events": []})
+        resp = client.get("/webhooks")
+        assert resp.status_code == 200
+        assert isinstance(resp.json(), list)
+
+    def test_subscribe_invalid_event_type_returns_422(self, client):
+        resp = client.post("/webhooks", json={"url": "http://example.com/h", "events": ["invalid_type"]})
+        assert resp.status_code == 422
+
+    def test_unsubscribe_removes_webhook(self, client):
+        # Subscribe
+        sub_resp = client.post("/webhooks", json={"url": "http://del-test.com/h", "events": []})
+        webhook_id = sub_resp.json()["webhook_id"]
+        # Unsubscribe
+        del_resp = client.delete(f"/webhooks/{webhook_id}")
+        assert del_resp.status_code == 204
+        # Verify gone from list
+        hooks = client.get("/webhooks").json()
+        ids = [h["webhook_id"] for h in hooks]
+        assert webhook_id not in ids
+
+    def test_unsubscribe_not_found_returns_404(self, client):
+        resp = client.delete("/webhooks/no-such-id")
+        assert resp.status_code == 404

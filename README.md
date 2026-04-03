@@ -70,36 +70,42 @@ Transaction types: `ship`, `receive`, `inspect`, `quarantine`, `release`.
 ## Project Structure
 
 ```
-ecn/
-├── __init__.py
-├── execution_engine.py         # Pure deterministic execution (state, tx) → new_state
-├── state_manager.py            # State storage, SHA-256 / Merkle hashing, trace
-├── node.py                     # Node: honest or malicious, optional Ed25519 signing
-├── consensus.py                # Plurality-vote consensus + signature verification
-├── network.py                  # Simulated broadcast network (in-process)
-├── crypto.py                   # Ed25519 key-gen, sign, verify; SignedResult type
-├── node_server.py              # Real asyncio TCP server wrapping a Node
-├── p2p_network.py              # Real TCP broadcast client + consensus
-├── audit.py                    # Structured audit trail (AuditEvent, AuditLog)
-├── api.py                      # FastAPI REST API — enterprise integration layer
-├── dashboard.py                # Rich CLI live dashboard + replay viewer
-├── trust_failure_demo.py       # Rich terminal trust-failure/attack detection demo
-├── main.py                     # Demo: 3 simulated scenarios
-├── demo_p2p.py                 # Demo: 4 real-TCP + signed + supply-chain scenarios
-├── use_cases/
-│   ├── __init__.py
-│   └── supply_chain.py         # Ship/receive/inspect/quarantine/release handlers
-└── tests/
-    ├── test_execution_engine.py
-    ├── test_state_manager.py
-    ├── test_consensus.py
-    ├── test_node.py
-    ├── test_network.py
-    ├── test_crypto.py          # Ed25519 key-gen, sign/verify, SignedResult
-    ├── test_p2p_network.py     # Real TCP integration tests
-    ├── test_supply_chain.py    # Supply chain transaction tests
-    ├── test_audit.py           # Audit trail unit + integration tests
-    └── test_api.py             # FastAPI REST API integration tests
+ECN/
+├── Dockerfile                  # Multi-stage container image for the ECN API
+├── docker-compose.yml          # Single-command local deployment (API + demo)
+├── requirements.txt            # Runtime dependencies
+├── k8s/
+│   └── ecn.yaml                # Kubernetes Namespace + Deployment + Service + HPA
+└── ecn/
+    ├── execution_engine.py     # Pure deterministic execution (state, tx) → new_state
+    ├── state_manager.py        # State storage, SHA-256 / Merkle hashing, trace
+    ├── node.py                 # Node: honest or malicious, optional Ed25519 signing
+    ├── consensus.py            # Plurality-vote consensus + signature verification
+    ├── network.py              # Simulated broadcast network (in-process)
+    ├── crypto.py               # Ed25519 key-gen, sign, verify; SignedResult type
+    ├── node_server.py          # Real asyncio TCP server wrapping a Node
+    ├── p2p_network.py          # Real TCP broadcast client + consensus
+    ├── audit.py                # Structured audit trail (AuditEvent, AuditLog)
+    ├── api.py                  # FastAPI REST API + webhook event streaming
+    ├── sdk.py                  # Python SDK client (ECNClient)
+    ├── dashboard.py            # Rich CLI live dashboard + replay viewer
+    ├── trust_failure_demo.py   # Rich terminal trust-failure/attack detection demo
+    ├── main.py                 # Demo: 3 simulated scenarios
+    ├── demo_p2p.py             # Demo: 4 real-TCP + signed + supply-chain scenarios
+    ├── use_cases/
+    │   └── supply_chain.py     # Ship/receive/inspect/quarantine/release handlers
+    └── tests/
+        ├── test_execution_engine.py
+        ├── test_state_manager.py
+        ├── test_consensus.py
+        ├── test_node.py
+        ├── test_network.py
+        ├── test_crypto.py
+        ├── test_p2p_network.py
+        ├── test_supply_chain.py
+        ├── test_audit.py
+        ├── test_api.py         # FastAPI REST API + webhook integration tests
+        └── test_sdk.py         # Python SDK unit tests
 ```
 
 ---
@@ -249,11 +255,146 @@ Response:
 ## Running the Tests
 
 ```bash
-pip install pytest fastapi "uvicorn[standard]" httpx
+pip install pytest fastapi "uvicorn[standard]" httpx requests
 python -m pytest ecn/tests/ -v
 ```
 
-141 tests, all passing.
+172 tests, all passing.
+
+---
+
+## Deployment
+
+### Docker (single container)
+
+```bash
+# Build the image
+docker build -t ecn:latest .
+
+# Run the API (all 5 supply-chain nodes start in-process)
+docker run -p 8000:8000 ecn:latest
+
+# API docs: http://localhost:8000/docs
+```
+
+### Docker Compose (multi-container demo)
+
+```bash
+# Start the ECN API in the background
+docker compose up -d
+
+# Run the trust-failure demo against the live container
+docker compose --profile demo up ecn-trust-demo
+
+# Tail API logs
+docker compose logs -f ecn-api
+
+# Stop everything
+docker compose down
+```
+
+### Kubernetes
+
+```bash
+# Deploy to the current cluster context
+kubectl apply -f k8s/ecn.yaml
+
+# Watch rollout
+kubectl -n ecn rollout status deployment/ecn-api
+
+# Port-forward to access the API locally
+kubectl -n ecn port-forward svc/ecn-api 8000:80
+
+# Scale up
+kubectl -n ecn scale deployment ecn-api --replicas=4
+
+# Tear down
+kubectl delete namespace ecn
+```
+
+The HorizontalPodAutoscaler automatically scales from 2 to 10 replicas based on CPU usage.
+
+---
+
+## Python SDK
+
+```python
+from ecn.sdk import ECNClient
+
+with ECNClient("http://localhost:8000") as client:
+    # Supply-chain transactions
+    result = client.ship("LAPTOP-001", destination="port", shipper="DHL")
+    result = client.inspect("LAPTOP-001", check_name="label_check", inspector="QA")
+    result = client.receive("LAPTOP-001", receiver="customs", at_customs=True)
+    result = client.quarantine("LAPTOP-001", reason="suspicious_origin")
+    result = client.release("LAPTOP-001", released_by="RegulatorA")
+
+    print(result["consensus_reached"])   # True
+    print(result["faulty_nodes"])        # [] (or list of malicious nodes)
+
+    # Network health
+    state = client.network_state()
+    print(f"Fault rate: {state['fault_rate'] * 100:.1f}%")
+
+    # Audit trail
+    summary = client.audit_summary()
+    print(summary["top_faulty_nodes"])
+
+    # Webhook event streaming (fire-and-forget HTTP POST to your system)
+    sub = client.subscribe_webhook("https://my-siem.example.com/ecn", events=["fault"])
+    print(sub["webhook_id"])             # save this to unsubscribe later
+    client.unsubscribe_webhook(sub["webhook_id"])
+```
+
+#### Error handling
+
+```python
+from ecn.sdk import ECNClient, ECNTransactionError, ECNNotFoundError
+
+with ECNClient("http://localhost:8000") as client:
+    try:
+        client.ship("UNKNOWN-PRODUCT", destination="port", shipper="DHL")
+    except ECNTransactionError as e:
+        print(f"Transaction rejected: {e.detail}")
+
+    try:
+        client.audit_event(9999)
+    except ECNNotFoundError:
+        print("Round not found")
+```
+
+---
+
+## Webhook Event Streaming
+
+Subscribe any HTTPS endpoint to receive real-time POST notifications:
+
+```bash
+# Subscribe to all events
+curl -X POST http://localhost:8000/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://my-system.com/ecn-hook", "events": []}'
+
+# Subscribe to fault events only
+curl -X POST http://localhost:8000/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://my-siem.com/alerts", "events": ["fault"]}'
+
+# List active subscriptions
+curl http://localhost:8000/webhooks
+
+# Unsubscribe
+curl -X DELETE http://localhost:8000/webhooks/<webhook_id>
+```
+
+Each POST delivery contains:
+```json
+{
+  "webhook_id": "...",
+  "event_types": ["transaction", "fault"],
+  "payload": { "<full AuditEvent>" }
+}
+```
 
 ---
 
@@ -265,6 +406,10 @@ python -m pytest ecn/tests/ -v
 - ✅ Supply chain domain use case (`use_cases/supply_chain.py`)
 - ✅ Structured audit trail — every round logged as `AuditEvent` (`audit.py`)
 - ✅ REST API — enterprise HTTP integration layer (`api.py`) with FastAPI
+- ✅ Webhook event streaming — subscribe any URL to real-time round notifications
+- ✅ Python SDK — `ECNClient` with typed helpers for all endpoints (`sdk.py`)
+- ✅ Docker — multi-stage `Dockerfile` + `docker-compose.yml`
+- ✅ Kubernetes — `k8s/ecn.yaml` with Deployment, Services, and HPA
 - ✅ Trust Failure Demo — rich terminal attack/detection narrative (`trust_failure_demo.py`)
 - ✅ Live CLI Dashboard — `rich`-powered visualization layer (`dashboard.py`)
 - ✅ Execution trace logging (per-node, per-transaction)

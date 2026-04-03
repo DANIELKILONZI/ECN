@@ -35,6 +35,16 @@ GET  /audit/replay
     Replay the full transaction history as a JSON array (for dashboards /
     replay viewers).
 
+POST /webhooks
+    Subscribe a URL to receive HTTP POST notifications after each round.
+    Supports optional event filtering ("transaction", "fault").
+
+GET  /webhooks
+    List all active webhook subscriptions.
+
+DELETE /webhooks/{webhook_id}
+    Remove a webhook subscription.
+
 Run with:
     python -m ecn.api               # starts on http://127.0.0.1:8000
     uvicorn ecn.api:app --reload    # dev mode
@@ -42,11 +52,13 @@ Run with:
 
 import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 
 from ecn.audit import AuditLog
 from ecn.p2p_network import P2PNetwork
@@ -65,6 +77,9 @@ register_supply_chain_handlers()
 _network: Optional[P2PNetwork] = None
 _audit_log: Optional[AuditLog] = None
 
+# Webhook registry — stored here so it survives for the app lifetime
+_webhook_registry: "WebhookRegistry"
+
 _DEFAULT_PRODUCT_IDS = ["LAPTOP-001", "PHONE-002", "TABLET-003"]
 _NODE_CONFIGS = [
     {"node_id": "Warehouse"},
@@ -82,7 +97,8 @@ _BASE_PORT = 18000
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _network, _audit_log
+    global _network, _audit_log, _webhook_registry
+    _webhook_registry = WebhookRegistry()
     _audit_log = AuditLog()
     _network = await P2PNetwork.create(
         node_configs=_NODE_CONFIGS,
@@ -288,6 +304,9 @@ async def submit_transaction(body: TransactionRequest):
     if event is None:
         raise HTTPException(status_code=500, detail="Audit event not recorded")
 
+    # Fire webhooks in the background (non-blocking)
+    asyncio.create_task(_webhook_registry.dispatch(event))
+
     return _event_to_response(event)
 
 
@@ -430,6 +449,197 @@ async def get_replay():
             for e in events
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Webhook Event Streaming
+# ---------------------------------------------------------------------------
+
+# Allowed event filter values
+_WEBHOOK_EVENTS = frozenset({"transaction", "fault"})
+
+
+class WebhookSubscription:
+    """Internal representation of a registered webhook subscriber."""
+
+    def __init__(self, url: str, events: List[str]) -> None:
+        self.webhook_id: str = str(uuid.uuid4())
+        self.url: str = url
+        self.events: List[str] = events  # empty = receive all events
+
+
+class WebhookRegistry:
+    """
+    In-memory registry of webhook subscriptions.
+
+    After each consensus round the ``dispatch`` method fires an async HTTP
+    POST to every matching subscriber.  Delivery failures are logged but
+    never raise (fire-and-forget semantics).
+    """
+
+    def __init__(self) -> None:
+        self._subscriptions: Dict[str, WebhookSubscription] = {}
+
+    def subscribe(self, url: str, events: List[str]) -> WebhookSubscription:
+        sub = WebhookSubscription(url=url, events=events)
+        self._subscriptions[sub.webhook_id] = sub
+        logger.info("Webhook subscribed: id=%s url=%s events=%s", sub.webhook_id, url, events)
+        return sub
+
+    def unsubscribe(self, webhook_id: str) -> bool:
+        if webhook_id in self._subscriptions:
+            del self._subscriptions[webhook_id]
+            logger.info("Webhook unsubscribed: id=%s", webhook_id)
+            return True
+        return False
+
+    def list_subscriptions(self) -> List[WebhookSubscription]:
+        return list(self._subscriptions.values())
+
+    async def dispatch(self, event) -> None:
+        """
+        Fire HTTP POST to every subscriber whose event filter matches.
+        Runs after a consensus round completes (background task).
+        """
+        if not self._subscriptions:
+            return
+
+        payload = event.to_dict()
+        # Annotate which event types this round triggered
+        triggered: List[str] = ["transaction"]
+        if event.has_fault():
+            triggered.append("fault")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for sub in list(self._subscriptions.values()):
+                # Filter: if subscriber specified events, only send matching ones
+                if sub.events and not any(t in sub.events for t in triggered):
+                    continue
+                try:
+                    resp = await client.post(
+                        sub.url,
+                        json={
+                            "webhook_id": sub.webhook_id,
+                            "event_types": triggered,
+                            "payload": payload,
+                        },
+                        headers={"Content-Type": "application/json", "X-ECN-Webhook": "1"},
+                    )
+                    logger.debug(
+                        "Webhook delivered: id=%s status=%d", sub.webhook_id, resp.status_code
+                    )
+                except Exception as exc:
+                    logger.warning("Webhook delivery failed: id=%s url=%s error=%s",
+                                   sub.webhook_id, sub.url, exc)
+
+
+# ---------------------------------------------------------------------------
+# Webhook Request/Response models
+# ---------------------------------------------------------------------------
+
+class WebhookSubscribeRequest(BaseModel):
+    url: str
+    events: List[str] = []  # empty = all events; options: "transaction", "fault"
+
+    def validate_events(self) -> None:
+        invalid = set(self.events) - _WEBHOOK_EVENTS
+        if invalid:
+            raise ValueError(f"Unknown event types: {invalid}. Valid: {_WEBHOOK_EVENTS}")
+
+
+class WebhookSubscribeResponse(BaseModel):
+    webhook_id: str
+    url: str
+    events: List[str]
+    message: str
+
+
+class WebhookInfo(BaseModel):
+    webhook_id: str
+    url: str
+    events: List[str]
+
+
+# ---------------------------------------------------------------------------
+# Webhook helper
+# ---------------------------------------------------------------------------
+
+def _require_webhooks() -> WebhookRegistry:
+    try:
+        return _webhook_registry
+    except NameError:
+        raise HTTPException(status_code=503, detail="Webhook registry not initialised")
+
+
+# ---------------------------------------------------------------------------
+# Routes — Webhooks
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/webhooks",
+    response_model=WebhookSubscribeResponse,
+    status_code=201,
+    summary="Subscribe a URL to receive webhook notifications",
+    tags=["Webhooks"],
+)
+async def subscribe_webhook(body: WebhookSubscribeRequest):
+    """
+    Register a URL to receive HTTP POST notifications after each consensus round.
+
+    **Event types** (optional filter — omit to receive all):
+    - ``"transaction"`` — fired after every round
+    - ``"fault"`` — fired only when at least one faulty node was detected
+
+    The webhook payload is the full `AuditEvent` JSON plus metadata:
+    ```json
+    {
+      "webhook_id": "...",
+      "event_types": ["transaction"],
+      "payload": { <AuditEvent> }
+    }
+    ```
+    """
+    try:
+        body.validate_events()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    registry = _require_webhooks()
+    sub = registry.subscribe(url=body.url, events=body.events)
+    return WebhookSubscribeResponse(
+        webhook_id=sub.webhook_id,
+        url=sub.url,
+        events=sub.events,
+        message="Webhook registered. You will receive POST requests after each consensus round.",
+    )
+
+
+@app.get(
+    "/webhooks",
+    response_model=List[WebhookInfo],
+    summary="List active webhook subscriptions",
+    tags=["Webhooks"],
+)
+async def list_webhooks():
+    """Return all currently active webhook subscriptions."""
+    registry = _require_webhooks()
+    return [
+        WebhookInfo(webhook_id=s.webhook_id, url=s.url, events=s.events)
+        for s in registry.list_subscriptions()
+    ]
+
+
+@app.delete(
+    "/webhooks/{webhook_id}",
+    status_code=204,
+    summary="Remove a webhook subscription",
+    tags=["Webhooks"],
+)
+async def unsubscribe_webhook(webhook_id: str):
+    """Unsubscribe a previously registered webhook."""
+    registry = _require_webhooks()
+    if not registry.unsubscribe(webhook_id):
+        raise HTTPException(status_code=404, detail=f"Webhook {webhook_id!r} not found")
 
 
 # ---------------------------------------------------------------------------

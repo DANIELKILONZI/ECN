@@ -80,9 +80,13 @@ ecn/
 ├── crypto.py                   # Ed25519 key-gen, sign, verify; SignedResult type
 ├── node_server.py              # Real asyncio TCP server wrapping a Node
 ├── p2p_network.py              # Real TCP broadcast client + consensus
+├── audit.py                    # Structured audit trail (AuditEvent, AuditLog)
+├── api.py                      # FastAPI REST API — enterprise integration layer
+├── dashboard.py                # Rich CLI live dashboard + replay viewer
+├── trust_failure_demo.py       # Rich terminal trust-failure/attack detection demo
 ├── main.py                     # Demo: 3 simulated scenarios
 ├── demo_p2p.py                 # Demo: 4 real-TCP + signed + supply-chain scenarios
-└── use_cases/
+├── use_cases/
 │   ├── __init__.py
 │   └── supply_chain.py         # Ship/receive/inspect/quarantine/release handlers
 └── tests/
@@ -93,7 +97,9 @@ ecn/
     ├── test_network.py
     ├── test_crypto.py          # Ed25519 key-gen, sign/verify, SignedResult
     ├── test_p2p_network.py     # Real TCP integration tests
-    └── test_supply_chain.py    # Supply chain transaction tests
+    ├── test_supply_chain.py    # Supply chain transaction tests
+    ├── test_audit.py           # Audit trail unit + integration tests
+    └── test_api.py             # FastAPI REST API integration tests
 ```
 
 ---
@@ -168,16 +174,86 @@ python -m ecn.main
 python -m ecn.demo_p2p
 ```
 
+### Trust Failure Demo (STEP 2 — enterprise showpiece)
+```bash
+python -m ecn.trust_failure_demo
+```
+
+Shows a pharmaceutical supply chain where a compromised auditor node attempts
+to inject a false state.  ECN detects the attack instantly, isolates the
+attacker, and prints a full cryptographically-verifiable audit trail.
+
+### Live CLI Dashboard (STEP 3 — visualization)
+```bash
+python -m ecn.dashboard
+```
+
+Launches a `rich`-powered live terminal dashboard with:
+- Network topology table (node IDs, ports, key prefixes, health)
+- Real-time transaction feed (round history)
+- Consensus health meter (fault rate, round counter)
+- Fault alert panel (recent attacks/anomalies)
+
+---
+
+## REST API — Enterprise Integration (GAP 3)
+
+Start the API server:
+```bash
+pip install fastapi "uvicorn[standard]"
+python -m ecn.api
+# or: uvicorn ecn.api:app --reload
+```
+
+API auto-docs: `http://127.0.0.1:8000/docs`
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/transactions` | Submit transaction; returns consensus result + all votes |
+| `GET` | `/network/nodes` | List all nodes (ID, port, public key, mode) |
+| `GET` | `/network/state` | Network health (fault rate, round counts) |
+| `GET` | `/audit/events` | Full paginated audit trail |
+| `GET` | `/audit/events/faults` | Only rounds with detected faults |
+| `GET` | `/audit/events/{round_id}` | Single round by number |
+| `GET` | `/audit/summary` | Aggregate statistics |
+| `GET` | `/audit/replay` | Transaction replay log (for dashboards) |
+
+### Example: Submit a supply-chain transaction
+
+```bash
+curl -X POST http://localhost:8000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"type":"ship","product_id":"LAPTOP-001","destination":"port","shipper":"DHL"}'
+```
+
+Response:
+```json
+{
+  "round_id": 1,
+  "timestamp": "2026-04-03T21:34:48Z",
+  "consensus_reached": true,
+  "agreed_hash": "910b2fbb...",
+  "honest_nodes": ["Warehouse", "Shipper", "Customs", "Insurer", "Retailer"],
+  "faulty_nodes": [],
+  "votes": [
+    { "node_id": "Warehouse", "state_hash": "910b2fbb...", "signature": "4696af...", "status": "honest" },
+    ...
+  ]
+}
+```
+
 ---
 
 ## Running the Tests
 
 ```bash
-pip install pytest
+pip install pytest fastapi "uvicorn[standard]" httpx
 python -m pytest ecn/tests/ -v
 ```
 
-101 tests, all passing.
+141 tests, all passing.
 
 ---
 
@@ -187,6 +263,10 @@ python -m pytest ecn/tests/ -v
 - ✅ Ed25519 digital signatures per node result (`crypto.py`)
 - ✅ Signature verification in consensus (bad/missing sigs → faulty)
 - ✅ Supply chain domain use case (`use_cases/supply_chain.py`)
+- ✅ Structured audit trail — every round logged as `AuditEvent` (`audit.py`)
+- ✅ REST API — enterprise HTTP integration layer (`api.py`) with FastAPI
+- ✅ Trust Failure Demo — rich terminal attack/detection narrative (`trust_failure_demo.py`)
+- ✅ Live CLI Dashboard — `rich`-powered visualization layer (`dashboard.py`)
 - ✅ Execution trace logging (per-node, per-transaction)
 - ✅ State diff output (shows which fields changed and by how much)
 - ✅ Merkle tree state hashing (opt-in via `use_merkle=True`)

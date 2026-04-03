@@ -79,6 +79,11 @@ class NodeServer:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @property
+    def malicious(self) -> bool:
+        """Return True if this node is running in malicious mode."""
+        return self._node.malicious
+
     async def start(self) -> None:
         """Start listening for incoming connections."""
         self._server = await asyncio.start_server(

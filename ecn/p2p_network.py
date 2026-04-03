@@ -61,9 +61,10 @@ class P2PNetwork:
         When *True*, print results to stdout after each broadcast.
     """
 
-    def __init__(self, servers: List[NodeServer], verbose: bool = True) -> None:
+    def __init__(self, servers: List[NodeServer], verbose: bool = True, audit_log=None) -> None:
         self._servers = servers
         self.verbose = verbose
+        self._audit_log = audit_log
         # Build node_id -> public_key mapping for signature verification
         self._public_keys: Dict[str, object] = {
             s.node_id: s.public_key for s in servers
@@ -81,6 +82,7 @@ class P2PNetwork:
         initial_state: State,
         base_port: int = 19000,
         verbose: bool = True,
+        audit_log=None,
     ) -> "P2PNetwork":
         """
         Create and start all node servers, then return a connected P2PNetwork.
@@ -96,6 +98,8 @@ class P2PNetwork:
         base_port : int
             Starting port for auto-assignment.
         verbose : bool
+        audit_log : AuditLog, optional
+            When provided, every round is recorded as an AuditEvent.
         """
         servers: List[NodeServer] = []
         for i, cfg in enumerate(node_configs):
@@ -113,7 +117,7 @@ class P2PNetwork:
 
         # Brief pause so all servers are ready to accept connections
         await asyncio.sleep(0.05)
-        return cls(servers=servers, verbose=verbose)
+        return cls(servers=servers, verbose=verbose, audit_log=audit_log)
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -143,6 +147,9 @@ class P2PNetwork:
         consensus_result = run_consensus(results, public_keys=self._public_keys)
         self._history.append((tx, results, consensus_result))
 
+        if self._audit_log is not None:
+            self._audit_log.record(tx, results, consensus_result)
+
         if self.verbose:
             self._print_round(tx, results, consensus_result)
 
@@ -156,6 +163,10 @@ class P2PNetwork:
         """Stop all node servers."""
         for server in self._servers:
             await server.stop()
+
+    def node_count(self) -> int:
+        """Return the number of nodes in the network."""
+        return len(self._servers)
 
     # ------------------------------------------------------------------
     # Private helpers

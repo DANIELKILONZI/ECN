@@ -35,6 +35,8 @@ class Network:
     public_keys : dict[str, Ed25519PublicKey], optional
         Mapping of ``node_id -> public_key``.  When provided, consensus
         verifies each result's signature before counting votes.
+    audit_log : AuditLog, optional
+        When provided, every round is recorded as an AuditEvent.
     """
 
     def __init__(
@@ -42,10 +44,12 @@ class Network:
         nodes: List[Node],
         verbose: bool = True,
         public_keys: Optional[Dict[str, object]] = None,
+        audit_log=None,
     ) -> None:
         self._nodes = list(nodes)
         self.verbose = verbose
         self._public_keys = public_keys or {}
+        self._audit_log = audit_log
         # History of (transaction, [NodeResult], ConsensusResult) tuples
         self._history: List[Tuple[Transaction, List[NodeResult], ConsensusResult]] = []
 
@@ -78,6 +82,9 @@ class Network:
         )
 
         self._history.append((tx, results, consensus_result))
+
+        if self._audit_log is not None:
+            self._audit_log.record(tx, results, consensus_result)
 
         if self.verbose:
             self._print_round(tx, results, consensus_result)

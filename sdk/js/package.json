@@ -1,0 +1,18 @@
+{
+  "name": "@ecn/client",
+  "version": "1.0.0",
+  "description": "JavaScript SDK for the ECN — Executable Consensus Network API",
+  "type": "module",
+  "exports": {
+    ".": "./ecn.js"
+  },
+  "main": "./ecn.js",
+  "scripts": {
+    "test": "node --test ecn.test.js"
+  },
+  "keywords": ["ecn", "consensus", "blockchain", "supply-chain"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

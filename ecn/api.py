@@ -45,6 +45,45 @@ GET  /webhooks
 DELETE /webhooks/{webhook_id}
     Remove a webhook subscription.
 
+GET  /stream/topics
+    List available event stream topics and their current offsets.
+
+GET  /stream/topics/{topic}?offset=0&limit=10
+    Kafka-style offset-based event poll.
+
+GET  /stream/events?topics=transactions,faults&limit=N
+    Server-Sent Events (SSE) live stream.
+
+POST /admin/api-keys
+    Issue a new API key (requires admin role when auth is enabled).
+
+GET  /admin/api-keys
+    List all issued API keys (secrets redacted).
+
+DELETE /admin/api-keys/{key_id}
+    Revoke an API key.
+
+POST /tenants
+    Create a new isolated tenant namespace.
+
+GET  /tenants
+    List all tenant namespaces.
+
+DELETE /tenants/{tenant_id}
+    Delete a tenant namespace and shut down its nodes.
+
+POST /tenants/{tenant_id}/transactions
+    Submit a transaction within a tenant namespace.
+
+GET  /tenants/{tenant_id}/network/state
+    Tenant network health.
+
+GET  /tenants/{tenant_id}/audit/events
+    Tenant audit trail.
+
+GET  /tenants/{tenant_id}/audit/summary
+    Tenant audit statistics.
+
 Run with:
     python -m ecn.api               # starts on http://127.0.0.1:8000
     uvicorn ecn.api:app --reload    # dev mode
@@ -57,11 +96,15 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 
 from ecn.audit import AuditLog
+from ecn.auth import init_registry, require_admin, require_role, ROLE_ADMIN, ROLE_SUBMITTER
 from ecn.p2p_network import P2PNetwork
+from ecn.stream import EventBus, sse_generator, TOPIC_TRANSACTIONS, TOPIC_FAULTS
+from ecn.tenant import init_tenant_registry, router as tenant_router
 from ecn.use_cases.supply_chain import register_supply_chain_handlers, make_initial_state
 
 logger = logging.getLogger(__name__)
@@ -80,6 +123,9 @@ _audit_log: Optional[AuditLog] = None
 # Webhook registry — stored here so it survives for the app lifetime
 _webhook_registry: "WebhookRegistry"
 
+# Event streaming bus
+_event_bus: Optional[EventBus] = None
+
 _DEFAULT_PRODUCT_IDS = ["LAPTOP-001", "PHONE-002", "TABLET-003"]
 _NODE_CONFIGS = [
     {"node_id": "Warehouse"},
@@ -97,8 +143,11 @@ _BASE_PORT = 18000
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _network, _audit_log, _webhook_registry
+    global _network, _audit_log, _webhook_registry, _event_bus
     _webhook_registry = WebhookRegistry()
+    _event_bus = EventBus()
+    init_registry()
+    init_tenant_registry()
     _audit_log = AuditLog()
     _network = await P2PNetwork.create(
         node_configs=_NODE_CONFIGS,
@@ -109,6 +158,11 @@ async def lifespan(app: FastAPI):
     )
     logger.info("ECN network started (%d nodes)", _network.node_count() if _network else 0)
     yield
+    from ecn.tenant import get_tenant_registry
+    try:
+        await get_tenant_registry().shutdown_all()
+    except RuntimeError:
+        pass
     if _network:
         await _network.shutdown()
     logger.info("ECN network stopped")
@@ -128,6 +182,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(tenant_router)
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +362,12 @@ async def submit_transaction(body: TransactionRequest):
 
     # Fire webhooks in the background (non-blocking)
     asyncio.create_task(_webhook_registry.dispatch(event))
+
+    # Publish to event streaming bus
+    if _event_bus is not None:
+        _event_bus.publish(TOPIC_TRANSACTIONS, event.to_dict())
+        if event.has_fault():
+            _event_bus.publish(TOPIC_FAULTS, event.to_dict())
 
     return _event_to_response(event)
 
@@ -640,6 +702,213 @@ async def unsubscribe_webhook(webhook_id: str):
     registry = _require_webhooks()
     if not registry.unsubscribe(webhook_id):
         raise HTTPException(status_code=404, detail=f"Webhook {webhook_id!r} not found")
+
+
+# ---------------------------------------------------------------------------
+# Routes — Event Streaming (Kafka-style)
+# ---------------------------------------------------------------------------
+
+def _require_event_bus() -> EventBus:
+    if _event_bus is None:
+        raise HTTPException(status_code=503, detail="Event bus not initialised")
+    return _event_bus
+
+
+@app.get(
+    "/stream/topics",
+    summary="List event stream topics",
+    tags=["Streaming"],
+)
+async def list_stream_topics():
+    """
+    List available event topics and their current state (buffered events,
+    next offset).  Use these offsets for Kafka-style polling.
+    """
+    bus = _require_event_bus()
+    return {"topics": bus.topic_info()}
+
+
+@app.get(
+    "/stream/topics/{topic}",
+    summary="Kafka-style offset-based event poll",
+    tags=["Streaming"],
+)
+async def poll_topic(
+    topic: str,
+    offset: int = Query(0, ge=0, description="Start from this absolute offset"),
+    limit: int = Query(10, ge=1, le=500, description="Max events to return"),
+):
+    """
+    Return buffered events from *topic* starting at *offset*.
+
+    Use the returned ``next_offset`` in your next poll request to avoid
+    receiving duplicates — this is the same pattern as Kafka's consumer API.
+
+    **Topics:** ``transactions``, ``faults``
+    """
+    bus = _require_event_bus()
+    try:
+        events = bus.consume(topic, offset=offset, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "topic": topic,
+        "offset": offset,
+        "count": len(events),
+        "next_offset": (events[-1]["seq"] + 1) if events else offset,
+        "events": events,
+    }
+
+
+@app.get(
+    "/stream/events",
+    summary="Server-Sent Events (SSE) live stream",
+    tags=["Streaming"],
+)
+async def stream_events(
+    topics: str = Query(
+        "transactions",
+        description="Comma-separated list of topics (e.g. 'transactions,faults')",
+    ),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description="Auto-close after this many events (omit for indefinite stream)",
+    ),
+    backfill: int = Query(
+        0,
+        ge=0,
+        le=500,
+        description="Replay this many recent buffered events before starting live stream",
+    ),
+):
+    """
+    Live Server-Sent Events stream.
+
+    Each event is delivered as an SSE ``data:`` line containing JSON::
+
+        data: {"seq": 3, "payload": {<AuditEvent>}}
+
+    Use ``backfill=N`` to replay up to N recent buffered events per topic
+    before switching to live streaming — provides Kafka-style reconnect
+    semantics.
+
+    A ``: heartbeat`` comment is sent every 15 seconds when idle to keep the
+    connection alive through proxies.
+
+    Connect with::
+
+        curl -N http://localhost:8000/stream/events
+        curl -N "http://localhost:8000/stream/events?topics=faults&limit=5"
+        curl -N "http://localhost:8000/stream/events?backfill=10&limit=10"
+    """
+    bus = _require_event_bus()
+    topic_list = [t.strip() for t in topics.split(",") if t.strip()]
+    return StreamingResponse(
+        sse_generator(bus, topic_list, limit=limit, backfill=backfill),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes — Admin / RBAC
+# ---------------------------------------------------------------------------
+
+class IssueApiKeyRequest(BaseModel):
+    role: str
+    description: str = ""
+    tenant_id: Optional[str] = None
+
+
+class ApiKeyResponse(BaseModel):
+    key_id: str
+    key: str
+    role: str
+    description: str
+    tenant_id: Optional[str]
+    message: str
+
+
+@app.post(
+    "/admin/api-keys",
+    response_model=ApiKeyResponse,
+    status_code=201,
+    summary="Issue a new API key",
+    tags=["Admin"],
+)
+async def issue_api_key(
+    body: IssueApiKeyRequest,
+    _auth=Depends(require_admin()),
+):
+    """
+    Issue a new API key with the given role.
+
+    **Roles:** ``admin``, ``submitter``, ``auditor``, ``readonly``
+
+    The key secret is returned **once** — store it securely.  It cannot be
+    retrieved again.
+
+    When ``ECN_AUTH_ENABLED`` is not set, this endpoint requires no key.
+    """
+    from ecn.auth import get_registry
+    try:
+        registry = get_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    try:
+        api_key = registry.issue(
+            role=body.role,
+            description=body.description,
+            tenant_id=body.tenant_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return ApiKeyResponse(
+        key_id=api_key.key_id,
+        key=api_key.key,
+        role=api_key.role,
+        description=api_key.description,
+        tenant_id=api_key.tenant_id,
+        message="Key issued. Store the 'key' value securely — it is shown only once.",
+    )
+
+
+@app.get(
+    "/admin/api-keys",
+    summary="List all issued API keys (secrets redacted)",
+    tags=["Admin"],
+)
+async def list_api_keys(_auth=Depends(require_admin())):
+    """Return all API keys with secret values redacted."""
+    from ecn.auth import get_registry
+    try:
+        registry = get_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"keys": registry.list_keys()}
+
+
+@app.delete(
+    "/admin/api-keys/{key_id}",
+    status_code=204,
+    summary="Revoke an API key",
+    tags=["Admin"],
+)
+async def revoke_api_key(key_id: str, _auth=Depends(require_admin())):
+    """Permanently revoke an API key."""
+    from ecn.auth import get_registry
+    try:
+        registry = get_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if not registry.revoke(key_id):
+        raise HTTPException(status_code=404, detail=f"Key {key_id!r} not found")
 
 
 # ---------------------------------------------------------------------------

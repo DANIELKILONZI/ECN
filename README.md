@@ -86,7 +86,10 @@ ECN/
     ├── node_server.py          # Real asyncio TCP server wrapping a Node
     ├── p2p_network.py          # Real TCP broadcast client + consensus
     ├── audit.py                # Structured audit trail (AuditEvent, AuditLog)
-    ├── api.py                  # FastAPI REST API + webhook event streaming
+    ├── stream.py               # Kafka-style EventBus (ring buffer, SSE, offset polling)
+    ├── auth.py                 # RBAC + API key registry (roles: admin/submitter/auditor/readonly)
+    ├── tenant.py               # Multi-tenant registry (per-tenant network isolation)
+    ├── api.py                  # FastAPI REST API + webhooks + streaming + admin + tenants
     ├── sdk.py                  # Python SDK client (ECNClient)
     ├── dashboard.py            # Rich CLI live dashboard + replay viewer
     ├── trust_failure_demo.py   # Rich terminal trust-failure/attack detection demo
@@ -105,7 +108,24 @@ ECN/
         ├── test_supply_chain.py
         ├── test_audit.py
         ├── test_api.py         # FastAPI REST API + webhook integration tests
-        └── test_sdk.py         # Python SDK unit tests
+        ├── test_sdk.py         # Python SDK unit tests
+        ├── test_stream.py      # EventBus unit tests + stream API tests
+        ├── test_auth.py        # RBAC unit tests + admin route tests
+        └── test_tenant_api.py  # Multi-tenant lifecycle + isolation tests
+```
+Also:
+```
+sdk/
+├── js/
+│   ├── ecn.js          # JavaScript SDK (fetch-based; Node.js 18+ / browser)
+│   ├── ecn.test.js     # 31 unit tests (node:test, mocked fetch)
+│   └── package.json
+├── go/
+│   ├── ecnclient.go    # Go SDK (net/http, no dependencies)
+│   ├── ecnclient_test.go  # 29 tests (net/http/httptest)
+│   └── go.mod
+└── java/
+    └── ECNClient.java  # Java 11+ SDK (java.net.http.HttpClient, no dependencies)
 ```
 
 ---
@@ -365,6 +385,149 @@ with ECNClient("http://localhost:8000") as client:
 
 ---
 
+## JavaScript SDK
+
+```bash
+# No dependencies — uses built-in fetch (Node 18+ or browser)
+```
+
+```js
+import { ECNClient } from './sdk/js/ecn.js';
+
+const client = new ECNClient('http://localhost:8000');
+
+// Supply-chain transactions
+const result = await client.ship('LAPTOP-001', { destination: 'port', shipper: 'DHL' });
+console.log(result.consensus_reached); // true
+
+// Kafka-style event polling (no broker needed)
+let offset = 0;
+while (true) {
+  const batch = await client.pollEvents('transactions', { offset, limit: 20 });
+  console.log(batch.events);
+  offset = batch.next_offset;
+  if (batch.count < 20) await new Promise(r => setTimeout(r, 1000));
+}
+
+// Multi-tenant
+const tenant = await client.createTenant('Bank-A', { nodeCount: 3 });
+await client.tenantShip(tenant.tenant_id, 'ITEM-001', { destination: 'vault', shipper: 'BankCo' });
+```
+
+Run tests: `cd sdk/js && node --test ecn.test.js` (31 tests)
+
+---
+
+## Go SDK
+
+```go
+import "github.com/ecn/sdk"
+
+client := ecnclient.New("http://localhost:8000", nil)
+
+// Ship a product
+result, err := client.Ship("LAPTOP-001", "port", "DHL")
+fmt.Println(result.ConsensusReached)  // true
+
+// Kafka-style event polling
+offset := 0
+for {
+    batch, _ := client.PollEvents("transactions", offset, 20)
+    // process batch.Events...
+    offset = batch.NextOffset
+    if batch.Count < 20 { time.Sleep(time.Second) }
+}
+
+// Multi-tenant
+tenant, _ := client.CreateTenant("Bank-A", 3, nil)
+result, _  = client.TenantShip(tenant.TenantID, "ITEM-001", "vault", "BankCo")
+
+// Authenticated deployment
+adminClient := ecnclient.New("http://ecn.internal", &ecnclient.Options{
+    APIKey: os.Getenv("ECN_API_KEY"),
+})
+```
+
+Run tests: `cd sdk/go && go test ./...` (29 tests)
+
+---
+
+## Java SDK
+
+```java
+import ecnclient.ECNClient;
+
+// Default: 30s timeout, no auth
+ECNClient client = new ECNClient("http://localhost:8000");
+
+// Or with auth and custom timeout:
+ECNClient client = ECNClient.builder("http://localhost:8000")
+    .apiKey(System.getenv("ECN_API_KEY"))
+    .timeout(Duration.ofSeconds(10))
+    .build();
+
+// Supply-chain (all methods return raw JSON strings)
+String result = client.ship("LAPTOP-001", "port", "DHL");
+String summary = client.auditSummary();
+
+// Kafka-style polling
+int offset = 0;
+while (true) {
+    String events = client.pollEvents("transactions", offset, 20);
+    // parse JSON, advance offset from next_offset field
+    Thread.sleep(1_000);
+}
+
+// Multi-tenant
+String tenant = client.createTenant("Bank-A", 3, List.of());
+// parse tenant_id from JSON
+String txResult = client.tenantShip(tenantId, "ITEM-001", "vault", "BankCo");
+```
+
+Requires Java 11+. Zero dependencies — uses `java.net.http.HttpClient`.
+
+---
+
+## Event Streaming (Kafka-style)
+
+The ECN stream layer provides topic-based event delivery without requiring an external Kafka broker.
+
+### Topics
+
+| Topic | When published |
+|-------|----------------|
+| `transactions` | After every consensus round |
+| `faults` | Only when ≥1 faulty node detected |
+
+### Offset-based polling
+
+```bash
+# List topics and current offsets
+curl http://localhost:8000/stream/topics
+
+# Poll 10 events from offset 0
+curl "http://localhost:8000/stream/topics/transactions?offset=0&limit=10"
+# Response includes next_offset — use it in the next request to avoid duplicates
+```
+
+### Server-Sent Events (SSE) live stream
+
+```bash
+# Live stream of all transactions
+curl -N http://localhost:8000/stream/events
+
+# Fault alerts only
+curl -N "http://localhost:8000/stream/events?topics=faults"
+
+# Backfill the last 50 events then continue live
+curl -N "http://localhost:8000/stream/events?backfill=50"
+```
+
+Each SSE data line is JSON: `{"seq": 3, "payload": {<AuditEvent>}}`.
+A `: heartbeat` comment is sent every 15 seconds when idle.
+
+---
+
 ## Webhook Event Streaming
 
 Subscribe any HTTPS endpoint to receive real-time POST notifications:
@@ -387,14 +550,84 @@ curl http://localhost:8000/webhooks
 curl -X DELETE http://localhost:8000/webhooks/<webhook_id>
 ```
 
-Each POST delivery contains:
-```json
-{
-  "webhook_id": "...",
-  "event_types": ["transaction", "fault"],
-  "payload": { "<full AuditEvent>" }
-}
+---
+
+## Enterprise Identity + RBAC
+
+Role-based access control is **opt-in** (off by default to preserve backward compatibility):
+
+```bash
+# Enable auth
+export ECN_AUTH_ENABLED=1
+export ECN_ADMIN_KEY=your-bootstrap-admin-key
+
+# Start server
+uvicorn ecn.api:app
 ```
+
+Issue keys via the admin API:
+```bash
+# Issue a submitter key (requires X-API-Key: <admin-key>)
+curl -X POST http://localhost:8000/admin/api-keys \
+  -H "X-API-Key: your-bootstrap-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "submitter", "description": "ci-pipeline"}'
+
+# Use the issued key for transactions
+curl -X POST http://localhost:8000/transactions \
+  -H "X-API-Key: <issued-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "ship", "product_id": "P1", "destination": "port", "shipper": "DHL"}'
+```
+
+| Role | Permitted operations |
+|------|---------------------|
+| `admin` | All operations + manage API keys |
+| `submitter` | POST /transactions + all GET endpoints |
+| `auditor` | GET /audit/* + GET /network/* + GET /stream/* |
+| `readonly` | GET /network/state + GET /audit/summary only |
+
+---
+
+## Multi-Tenant Isolation
+
+Each tenant gets a fully independent execution environment (nodes, audit trail, webhooks):
+
+```bash
+# Create a tenant (spawns its own 3-node network on OS-assigned ports)
+curl -X POST http://localhost:8000/tenants \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Bank-A", "node_count": 3}'
+
+# Submit a transaction within the tenant namespace
+curl -X POST http://localhost:8000/tenants/<tenant_id>/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"type": "ship", "product_id": "ITEM-001", "destination": "vault", "shipper": "BankCo"}'
+
+# Check tenant audit summary (isolated from all other tenants)
+curl http://localhost:8000/tenants/<tenant_id>/audit/summary
+
+# Delete tenant (shuts down its nodes)
+curl -X DELETE http://localhost:8000/tenants/<tenant_id>
+```
+
+Tenant routes mirror the global API under `/tenants/{tenant_id}/`:
+- `POST   /tenants/{id}/transactions`
+- `GET    /tenants/{id}/network/state`
+- `GET    /tenants/{id}/audit/events`
+- `GET    /tenants/{id}/audit/summary`
+- `POST/GET/DELETE /tenants/{id}/webhooks`
+
+---
+
+## Running the Tests
+
+```bash
+pip install pytest fastapi "uvicorn[standard]" httpx requests
+python -m pytest ecn/tests/ -v
+```
+
+254 tests, all passing.
 
 ---
 
@@ -408,6 +641,12 @@ Each POST delivery contains:
 - ✅ REST API — enterprise HTTP integration layer (`api.py`) with FastAPI
 - ✅ Webhook event streaming — subscribe any URL to real-time round notifications
 - ✅ Python SDK — `ECNClient` with typed helpers for all endpoints (`sdk.py`)
+- ✅ JavaScript SDK — `ECNClient` (fetch-based, Node 18+/browser) with 31 tests (`sdk/js/`)
+- ✅ Go SDK — typed `ECNClient` (zero dependencies) with 29 tests (`sdk/go/`)
+- ✅ Java SDK — `ECNClient` (Java 11+, `java.net.http`) (`sdk/java/`)
+- ✅ Event streaming backbone — `EventBus` ring buffer, Kafka-style offset polling, SSE live stream (`stream.py`)
+- ✅ Enterprise Identity + RBAC — API key registry, 4 roles, FastAPI dependency injection (`auth.py`)
+- ✅ Multi-tenant isolation — per-tenant P2PNetwork + AuditLog on OS-assigned ports (`tenant.py`)
 - ✅ Docker — multi-stage `Dockerfile` + `docker-compose.yml`
 - ✅ Kubernetes — `k8s/ecn.yaml` with Deployment, Services, and HPA
 - ✅ Trust Failure Demo — rich terminal attack/detection narrative (`trust_failure_demo.py`)

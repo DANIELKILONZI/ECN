@@ -85,12 +85,19 @@ class NodeServer:
         return self._node.malicious
 
     async def start(self) -> None:
-        """Start listening for incoming connections."""
+        """Start listening for incoming connections.
+
+        When ``port`` is 0 the OS assigns a free port; ``self.port`` is
+        updated to reflect the actual bound port after this method returns.
+        """
         self._server = await asyncio.start_server(
             self._handle_client,
             host=self.host,
             port=self.port,
         )
+        # If port=0 was requested, read back the OS-assigned port
+        if self.port == 0:
+            self.port = self._server.sockets[0].getsockname()[1]
         logger.info(
             "NodeServer %s listening on %s:%d (pubkey=%s...)",
             self.node_id,

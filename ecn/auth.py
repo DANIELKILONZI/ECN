@@ -248,19 +248,33 @@ def init_registry(store: "Optional[KeyStore]" = None) -> ApiKeyRegistry:
         admin_secret = os.environ.get("ECN_ADMIN_KEY", "").strip()
         if not admin_secret:
             admin_secret = secrets.token_urlsafe(32)
-            # Write to stdout — not to the log — so it does not end up in
-            # log-aggregation systems (SIEM, Splunk, CloudWatch, etc.).
-            # In production always set ECN_ADMIN_KEY explicitly.
+            # Write the key to a dedicated bootstrap file so it is not captured
+            # by log-aggregation systems (SIEM, Splunk, CloudWatch, etc.).
+            # The operator should read /tmp/ecn-bootstrap-key, set ECN_ADMIN_KEY,
+            # then delete the file.
             import sys
-            print(
-                f"[ECN] ECN_AUTH_ENABLED is set but ECN_ADMIN_KEY is not. "
-                f"Generated bootstrap admin key (set ECN_ADMIN_KEY to avoid regeneration): "
-                f"{admin_secret}",
-                file=sys.stderr,
-            )
+            _bootstrap_path = "/tmp/ecn-bootstrap-key"
+            try:
+                with open(_bootstrap_path, "w") as _f:
+                    _f.write(admin_secret + "\n")
+                print(
+                    f"[ECN] ECN_AUTH_ENABLED is set but ECN_ADMIN_KEY is not. "
+                    f"Bootstrap admin key written to {_bootstrap_path}. "
+                    f"Set ECN_ADMIN_KEY to that value to persist it across restarts.",
+                    file=sys.stderr,
+                )
+            except OSError:
+                # If we cannot write to /tmp, fall back to printing to stderr
+                # (test environments, read-only filesystems).
+                print(
+                    "[ECN] ECN_AUTH_ENABLED is set but ECN_ADMIN_KEY is not. "
+                    "Could not write bootstrap key file. "
+                    "Set ECN_ADMIN_KEY explicitly to a secure random value.",
+                    file=sys.stderr,
+                )
             logger.warning(
                 "ECN_AUTH_ENABLED is set but ECN_ADMIN_KEY is not — "
-                "generated a temporary bootstrap key (see stderr for value). "
+                "generated a temporary bootstrap key. "
                 "Set ECN_ADMIN_KEY to use a fixed key."
             )
         # Only issue bootstrap admin if it doesn't already exist in the store

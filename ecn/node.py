@@ -7,6 +7,7 @@ Each node:
 - Holds its own independent copy of the world state.
 - Executes transactions independently and deterministically.
 - Produces a state hash after each execution for consensus comparison.
+- Optionally signs its result with an Ed25519 private key (trust layer).
 - Optionally operates in "malicious mode" to simulate Byzantine faults.
 """
 
@@ -34,9 +35,12 @@ class NodeResult:
         Full resulting state (deep copy).
     trace_entry : dict
         Execution trace entry recorded by StateManager.
+    signature : str or None
+        Hex-encoded Ed25519 signature over SHA-256(node_id + ":" + state_hash).
+        Present when the node was initialised with a signing key.
     """
 
-    __slots__ = ("node_id", "state_hash", "result_state", "trace_entry")
+    __slots__ = ("node_id", "state_hash", "result_state", "trace_entry", "signature")
 
     def __init__(
         self,
@@ -44,16 +48,19 @@ class NodeResult:
         state_hash: str,
         result_state: State,
         trace_entry: Dict[str, Any],
+        signature: Optional[str] = None,
     ) -> None:
         self.node_id = node_id
         self.state_hash = state_hash
         self.result_state = result_state
         self.trace_entry = trace_entry
+        self.signature = signature
 
     def __repr__(self) -> str:
+        sig_info = f", sig={self.signature[:16]}..." if self.signature else ""
         return (
             f"NodeResult(node_id={self.node_id!r}, "
-            f"state_hash={self.state_hash[:16]}...)"
+            f"state_hash={self.state_hash[:16]}...{sig_info})"
         )
 
 
@@ -77,6 +84,10 @@ class Node:
         but the reported hash is artificially corrupted).
     use_merkle : bool
         Forwarded to the underlying ``StateManager``.
+    signing_key : optional
+        An ``Ed25519PrivateKey`` instance.  When provided every
+        ``NodeResult`` will carry a hex-encoded signature over
+        ``SHA-256(node_id + ":" + state_hash)``.
     """
 
     def __init__(
@@ -85,9 +96,11 @@ class Node:
         initial_state: State,
         malicious: bool = False,
         use_merkle: bool = False,
+        signing_key=None,
     ) -> None:
         self.node_id = node_id
         self.malicious = malicious
+        self._signing_key = signing_key
         self._manager = StateManager(
             initial_state=initial_state,
             use_merkle=use_merkle,
@@ -105,13 +118,20 @@ class Node:
         -------
         NodeResult
             Contains the resulting state hash and full state.  If the node
-            is malicious the reported hash is deliberately corrupted.
+            has a signing key the result carries a cryptographic signature.
+            If the node is malicious the reported hash is deliberately corrupted.
         """
         new_state = self._manager.apply_transaction(tx)
         true_hash = self._manager.compute_state_hash()
 
         # Malicious nodes report a corrupted hash
         reported_hash = self._corrupt_hash(true_hash) if self.malicious else true_hash
+
+        # Sign the (node_id, reported_hash) pair when a key is available
+        signature: Optional[str] = None
+        if self._signing_key is not None:
+            from ecn.crypto import sign_result
+            signature = sign_result(self.node_id, reported_hash, self._signing_key)
 
         trace = self._manager.get_trace()[-1]  # last trace entry
 
@@ -120,6 +140,7 @@ class Node:
             state_hash=reported_hash,
             result_state=new_state,
             trace_entry=trace,
+            signature=signature,
         )
 
     def get_state(self) -> State:
@@ -140,7 +161,8 @@ class Node:
 
     def __repr__(self) -> str:
         mode = "MALICIOUS" if self.malicious else "honest"
-        return f"Node(id={self.node_id!r}, mode={mode})"
+        signed = ", signed" if self._signing_key else ""
+        return f"Node(id={self.node_id!r}, mode={mode}{signed})"
 
     # ------------------------------------------------------------------
     # Private helpers

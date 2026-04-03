@@ -6,12 +6,12 @@ Simulates the distributed ECN network.
 Responsibilities:
 - Hold a collection of nodes
 - Broadcast a transaction to all nodes simultaneously (simulated)
-- Collect execution results
-- Run a consensus round
+- Collect execution results (optionally with cryptographic signatures)
+- Run a consensus round (optionally with signature verification)
 - Print per-node and consensus output
 """
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ecn.node import Node, NodeResult
 from ecn.consensus import ConsensusResult, run_consensus
@@ -32,11 +32,20 @@ class Network:
         Pre-constructed node instances to include in the network.
     verbose : bool
         When *True*, ``broadcast()`` prints results to stdout.
+    public_keys : dict[str, Ed25519PublicKey], optional
+        Mapping of ``node_id -> public_key``.  When provided, consensus
+        verifies each result's signature before counting votes.
     """
 
-    def __init__(self, nodes: List[Node], verbose: bool = True) -> None:
+    def __init__(
+        self,
+        nodes: List[Node],
+        verbose: bool = True,
+        public_keys: Optional[Dict[str, object]] = None,
+    ) -> None:
         self._nodes = list(nodes)
         self.verbose = verbose
+        self._public_keys = public_keys or {}
         # History of (transaction, [NodeResult], ConsensusResult) tuples
         self._history: List[Tuple[Transaction, List[NodeResult], ConsensusResult]] = []
 
@@ -63,7 +72,10 @@ class Network:
             result = node.execute_transaction(tx)
             results.append(result)
 
-        consensus_result = run_consensus(results)
+        consensus_result = run_consensus(
+            results,
+            public_keys=self._public_keys if self._public_keys else None,
+        )
 
         self._history.append((tx, results, consensus_result))
 
@@ -94,7 +106,18 @@ class Network:
         print(f"Transaction: {tx}")
         print("-" * 60)
         for r in results:
-            flag = "  ← FAULT DETECTED" if r.node_id in cr.faulty_nodes else ""
+            flags = []
+            if r.node_id in cr.invalid_sig_nodes:
+                flags.append("INVALID SIG")
+            elif r.node_id in cr.faulty_nodes:
+                flags.append("FAULT DETECTED")
+            flag_str = "  ← " + ", ".join(flags) if flags else ""
+
+            # Signature status indicator
+            sig_str = ""
+            if r.signature is not None:
+                sig_str = f"  sig={r.signature[:12]}..."
+
             # Print execution trace diff if available
             diff = r.trace_entry.get("diff", {})
             diff_str = ""
@@ -104,7 +127,7 @@ class Network:
                     parts.append(f"{acc}: {old_v}→{new_v}")
                 diff_str = "  diff=[" + ", ".join(parts) + "]"
             print(
-                f"  {r.node_id:<12} → hash: {r.state_hash}{diff_str}{flag}"
+                f"  {r.node_id:<12} → hash: {r.state_hash}{sig_str}{diff_str}{flag_str}"
             )
         print("-" * 60)
         if cr.consensus_reached:

@@ -1,0 +1,271 @@
+# ---------------------------------------------------------------------------
+# ECN — Executable Consensus Network
+# Kubernetes manifests
+#
+# Deploy to a cluster:
+#   kubectl apply -f k8s/ecn.yaml
+#
+# Check status:
+#   kubectl -n ecn get all
+#
+# Access the API (port-forward):
+#   kubectl -n ecn port-forward svc/ecn-api 8000:8000
+#   # then: curl http://localhost:8000/docs
+#
+# Scale the API replicas:
+#   kubectl -n ecn scale deployment ecn-api --replicas=3
+#
+# Clean up:
+#   kubectl delete namespace ecn
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Namespace
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: namespace
+
+---
+
+# ---------------------------------------------------------------------------
+# ConfigMap — runtime configuration shared across all ECN pods
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecn-config
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: config
+data:
+  # Comma-separated product IDs to pre-populate in the supply-chain state
+  ECN_PRODUCTS: "LAPTOP-001,PHONE-002,TABLET-003,WATCH-004,CAMERA-005"
+  # Comma-separated node IDs for the verifier network
+  ECN_NODES: "Warehouse,Shipper,Customs,Insurer,Retailer"
+  # Base port for internal node TCP servers (inside each pod)
+  ECN_BASE_PORT: "18000"
+  # Logging level
+  LOG_LEVEL: "INFO"
+  # Node bind address — 0.0.0.0 makes nodes reachable across pods/machines.
+  # Override to 127.0.0.1 for single-host / demo deployments.
+  ECN_NODE_HOST: "0.0.0.0"
+  # Consensus quorum threshold (fraction of responding nodes that must agree).
+  # 0.51 = strict majority (default). Use 0.67 for classical 1/3 BFT tolerance.
+  ECN_QUORUM_THRESHOLD: "0.51"
+  # Billing period granularity: monthly (default), daily, yearly
+  ECN_BILLING_PERIOD: "monthly"
+
+---
+
+# ---------------------------------------------------------------------------
+# Secret — sensitive runtime values (replace placeholders before deploying)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ecn-secrets
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: secrets
+type: Opaque
+stringData:
+  # Bootstrap admin API key — set before deploying (base64-encoded in real clusters)
+  ECN_ADMIN_KEY: "REPLACE_WITH_SECURE_RANDOM_SECRET"
+  # HS256 JWT shared secret for Bearer token OAuth2/SSO integration (optional)
+  ECN_JWT_SECRET: ""
+  # Expected JWT issuer claim (optional, e.g. https://your-okta-domain/oauth2/default)
+  ECN_JWT_ISSUER: ""
+  # Expected JWT audience claim (optional, e.g. ecn-api)
+  ECN_JWT_AUDIENCE: ""
+
+---
+
+# ---------------------------------------------------------------------------
+# PersistentVolumeClaim — durable storage for audit log, API keys, billing
+# Survives pod restarts and reschedules.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ecn-data
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # StorageClass — use your cloud provider's recommended class:
+  # AWS: gp3   GCP: standard   Azure: managed-premium   local: hostpath
+  storageClassName: standard
+
+---
+
+# ---------------------------------------------------------------------------
+# Deployment — ECN REST API
+# Each replica runs its own fully independent ECN network of in-process
+# node servers, providing horizontal scalability of the API tier.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecn-api
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecn-api
+  template:
+    metadata:
+      labels:
+        app: ecn-api
+        app.kubernetes.io/name: ecn
+        app.kubernetes.io/component: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: ecn-api
+          image: ecn:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: ecn-config
+            - secretRef:
+                name: ecn-secrets
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Point ECN at the persistent volume for durable storage.
+            # Remove this env var to use in-memory mode (original behaviour).
+            - name: ECN_DB_PATH
+              value: "/var/ecn/ecn.db"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: ecn-data
+              mountPath: /var/ecn
+          readinessProbe:
+            httpGet:
+              path: /network/state
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /network/state
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: ecn-data
+          persistentVolumeClaim:
+            claimName: ecn-data
+
+---
+
+# ---------------------------------------------------------------------------
+# Service — ClusterIP (internal access within the cluster)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecn-api
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: api-service
+spec:
+  type: ClusterIP
+  selector:
+    app: ecn-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+
+---
+
+# ---------------------------------------------------------------------------
+# Service — NodePort (external access for demos / local clusters)
+# Change to LoadBalancer for cloud deployments.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecn-api-external
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: api-external-service
+spec:
+  type: NodePort
+  selector:
+    app: ecn-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      nodePort: 30800
+      protocol: TCP
+
+---
+
+# ---------------------------------------------------------------------------
+# HorizontalPodAutoscaler — scale API replicas on CPU load
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ecn-api-hpa
+  namespace: ecn
+  labels:
+    app.kubernetes.io/name: ecn
+    app.kubernetes.io/component: autoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ecn-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

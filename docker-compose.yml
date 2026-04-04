@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# ECN — Executable Consensus Network
+# docker-compose.yml
+#
+# Runs a 5-node ECN supply-chain network with a REST API gateway.
+#
+# Usage:
+#   docker compose up          # start everything
+#   docker compose up -d       # start in background
+#   docker compose logs -f     # follow logs
+#   docker compose down        # stop and remove containers
+#
+# Once running:
+#   API docs:  http://localhost:8000/docs
+#   Submit tx: curl -X POST http://localhost:8000/transactions \
+#                -H "Content-Type: application/json" \
+#                -d '{"type":"ship","product_id":"LAPTOP-001","destination":"port","shipper":"DHL"}'
+# ---------------------------------------------------------------------------
+services:
+
+  # --------------------------------------------------------------------------
+  # ECN API Gateway
+  # Exposes the REST API and manages all 5 supply-chain verifier nodes
+  # internally (in-process asyncio TCP servers).
+  # --------------------------------------------------------------------------
+  ecn-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: ecn:latest
+    container_name: ecn-api
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Override default product IDs (comma-separated)
+      ECN_PRODUCTS: "LAPTOP-001,PHONE-002,TABLET-003,WATCH-004,CAMERA-005"
+      # Node IDs (comma-separated)
+      ECN_NODES: "Warehouse,Shipper,Customs,Insurer,Retailer"
+      # Base port for internal node servers (inside container)
+      ECN_BASE_PORT: "18000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/network/state')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Trust Failure Demo
+  # Runs the one-shot rich terminal trust-failure demo against the live API.
+  # Starts after the API is healthy; exits when complete.
+  # To run manually: docker compose run --rm ecn-trust-demo
+  # --------------------------------------------------------------------------
+  ecn-trust-demo:
+    image: ecn:latest
+    container_name: ecn-trust-demo
+    depends_on:
+      ecn-api:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "-m", "ecn.trust_failure_demo"]
+    restart: "no"
+    profiles:
+      - demo

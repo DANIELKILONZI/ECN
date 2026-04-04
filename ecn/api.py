@@ -90,13 +90,15 @@ Run with:
 """
 
 import asyncio
+import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 
@@ -104,16 +106,26 @@ from ecn.audit import AuditLog
 from ecn.auth import init_registry, require_admin, require_role, ROLE_ADMIN, ROLE_SUBMITTER
 from ecn.billing import (
     BillingTracker,
+    BillingLedgerEntry,
+    BillingLedgerResponse,
+    SLAResponse,
     StripeWebhookPayload,
     StripeWebhookResponse,
     UsageResponse,
     handle_stripe_event,
     init_tracker,
 )
+from ecn.node_health import init_health_registry, get_health_registry
 from ecn.p2p_network import P2PNetwork
 from ecn.persistence import open_from_env
 from ecn.stream import EventBus, sse_generator, TOPIC_TRANSACTIONS, TOPIC_FAULTS
 from ecn.tenant import init_tenant_registry, router as tenant_router
+from ecn.transaction import (
+    TransactionRecord,
+    TxState,
+    new_record,
+    transition,
+)
 from ecn.use_cases.supply_chain import register_supply_chain_handlers, make_initial_state
 
 logger = logging.getLogger(__name__)
@@ -128,6 +140,10 @@ register_supply_chain_handlers()
 # ---------------------------------------------------------------------------
 _network: Optional[P2PNetwork] = None
 _audit_log: Optional[AuditLog] = None
+
+# In-memory transaction lifecycle store (supplemented by SQLiteTransactionStore when DB is set)
+_tx_store: Dict[str, TransactionRecord] = {}
+_tx_persistent_store = None  # SQLiteTransactionStore | None
 
 # Webhook registry — stored here so it survives for the app lifetime
 _webhook_registry: "WebhookRegistry"
@@ -152,14 +168,17 @@ _BASE_PORT = 18000
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _network, _audit_log, _webhook_registry, _event_bus
+    global _network, _audit_log, _webhook_registry, _event_bus, _tx_store, _tx_persistent_store
     _webhook_registry = WebhookRegistry()
     _event_bus = EventBus()
+    _tx_store = {}
     # Open persistent stores (no-op when ECN_DB_PATH is not set)
     stores = open_from_env()
     init_registry(store=stores["key_store"])
-    init_tracker(store=stores["billing_store"])
+    init_tracker(store=stores["billing_store"], ledger=stores.get("billing_ledger"))
     init_tenant_registry()
+    init_health_registry()
+    _tx_persistent_store = stores.get("tx_store")
     _audit_log = AuditLog(store=stores["audit_store"])
     _network = await P2PNetwork.create(
         node_configs=_NODE_CONFIGS,
@@ -167,6 +186,7 @@ async def lifespan(app: FastAPI):
         base_port=_BASE_PORT,
         verbose=False,
         audit_log=_audit_log,
+        health_registry=get_health_registry(),
     )
     logger.info("ECN network started (%d nodes)", _network.node_count() if _network else 0)
     yield
@@ -196,6 +216,19 @@ app = FastAPI(
 )
 
 app.include_router(tenant_router)
+
+
+# ---------------------------------------------------------------------------
+# Observability: X-ECN-Request-ID on every response
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Attach X-ECN-Request-ID to every response for distributed tracing."""
+    request_id = request.headers.get("X-ECN-Request-ID") or str(uuid.uuid4())
+    response: Response = await call_next(request)
+    response.headers["X-ECN-Request-ID"] = request_id
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +293,8 @@ class NodeVoteResponse(BaseModel):
 
 
 class TransactionResponse(BaseModel):
+    tx_id: str
+    lifecycle_state: str
     round_id: int
     timestamp: str
     transaction: Dict[str, Any]
@@ -269,6 +304,21 @@ class TransactionResponse(BaseModel):
     faulty_nodes: List[str]
     invalid_sig_nodes: List[str]
     votes: List[NodeVoteResponse]
+    billed_amount: float
+    duration_ms: int
+
+
+class TransactionStatusResponse(BaseModel):
+    tx_id: str
+    tenant_id: str
+    lifecycle_state: str
+    node_count: int
+    consensus_reached: bool
+    fault_count: int
+    duration_ms: int
+    billed_amount: float
+    created_at: str
+    finalized_at: Optional[str]
 
 
 class NodeInfo(BaseModel):
@@ -311,8 +361,41 @@ def _require_audit() -> AuditLog:
     return _audit_log
 
 
-def _event_to_response(event) -> Dict[str, Any]:
+def _save_tx_record(record: TransactionRecord) -> None:
+    """Persist a transaction record to both in-memory cache and durable store."""
+    _tx_store[record.tx_id] = record
+    if _tx_persistent_store is not None:
+        _tx_persistent_store.save(record.to_dict())
+
+
+def _load_tx_record(tx_id: str) -> Optional[TransactionRecord]:
+    """Load a transaction record by tx_id (in-memory first, then durable store)."""
+    if tx_id in _tx_store:
+        return _tx_store[tx_id]
+    if _tx_persistent_store is not None:
+        d = _tx_persistent_store.load(tx_id)
+        if d:
+            rec = TransactionRecord(
+                tx_id=d["tx_id"],
+                tenant_id=d["tenant_id"],
+                state=TxState(d["state"]),
+                node_count=d["node_count"],
+                consensus_reached=d["consensus_reached"],
+                fault_count=d["fault_count"],
+                duration_ms=d["duration_ms"],
+                billed_amount=d["billed_amount"],
+                created_at=d["created_at"],
+                finalized_at=d["finalized_at"],
+            )
+            _tx_store[tx_id] = rec
+            return rec
+    return None
+
+
+def _event_to_response(event, tx_rec: Optional[TransactionRecord] = None) -> Dict[str, Any]:
     return {
+        "tx_id": tx_rec.tx_id if tx_rec else "",
+        "lifecycle_state": tx_rec.state.value if tx_rec else TxState.REPLICATED.value,
         "round_id": event.round_id,
         "timestamp": event.timestamp,
         "transaction": event.transaction,
@@ -330,6 +413,8 @@ def _event_to_response(event) -> Dict[str, Any]:
             }
             for v in event.votes
         ],
+        "billed_amount": tx_rec.billed_amount if tx_rec else 0.0,
+        "duration_ms": tx_rec.duration_ms if tx_rec else 0,
     }
 
 
@@ -349,13 +434,33 @@ async def submit_transaction(body: TransactionRequest):
 
     All nodes independently execute the transaction, sign their result,
     and the API returns the consensus outcome including any fault detections.
+
+    The response includes a ``tx_id`` and ``lifecycle_state`` for lifecycle
+    tracking.  Use ``GET /transactions/{tx_id}`` to poll status.
     """
     net = _require_network()
     audit = _require_audit()
 
     tx = body.to_ecn_tx()
+    node_count = net.node_count()
+
+    # --- Lifecycle: INITIATED ---
+    rec = new_record(tenant_id="", node_count=node_count)
+    _save_tx_record(rec)
+
+    # --- Lifecycle: EXECUTING ---
+    rec = transition(rec, TxState.EXECUTING)
+    _save_tx_record(rec)
 
     try:
+        # --- Lifecycle: PROPOSED (broadcast starts) ---
+        rec = transition(rec, TxState.PROPOSED)
+        _save_tx_record(rec)
+
+        # --- Lifecycle: CONSENSUS_PENDING ---
+        rec = transition(rec, TxState.CONSENSUS_PENDING)
+        _save_tx_record(rec)
+
         results, cr = await net.broadcast(tx)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -372,6 +477,51 @@ async def submit_transaction(body: TransactionRequest):
     if event is None:
         raise HTTPException(status_code=500, detail="Audit event not recorded")
 
+    # Update record with consensus outcome
+    from dataclasses import replace as _dc_replace
+    rec = _dc_replace(
+        rec,
+        consensus_reached=cr.consensus_reached,
+        fault_count=len(cr.faulty_nodes),
+        node_count=len(results) + len(cr.faulty_nodes),
+    )
+
+    # --- Lifecycle: FINALIZED (triggers audit) ---
+    rec = transition(rec, TxState.FINALIZED)
+    _save_tx_record(rec)
+    logger.info(
+        json.dumps({
+            "event": "tx_finalized",
+            "tx_id": rec.tx_id,
+            "tenant_id": rec.tenant_id,
+            "state": rec.state.value,
+            "duration_ms": rec.duration_ms,
+            "consensus_reached": rec.consensus_reached,
+            "fault_count": rec.fault_count,
+        })
+    )
+
+    # --- Lifecycle: BILLED (triggers billing) ---
+    rec = transition(rec, TxState.BILLED)
+    try:
+        from ecn.billing import get_tracker
+        tracker = get_tracker()
+        billed = tracker.record_round(
+            tenant_id=rec.tenant_id,
+            tx_id=rec.tx_id,
+            node_count=rec.node_count,
+            consensus_reached=rec.consensus_reached,
+        )
+        from dataclasses import replace as _dc_replace2
+        rec = _dc_replace2(rec, billed_amount=billed)
+    except RuntimeError:
+        pass
+    _save_tx_record(rec)
+
+    # --- Lifecycle: REPLICATED ---
+    rec = transition(rec, TxState.REPLICATED)
+    _save_tx_record(rec)
+
     # Fire webhooks in the background (non-blocking)
     asyncio.create_task(_webhook_registry.dispatch(event))
 
@@ -381,7 +531,42 @@ async def submit_transaction(body: TransactionRequest):
         if event.has_fault():
             _event_bus.publish(TOPIC_FAULTS, event.to_dict())
 
-    return _event_to_response(event)
+    return _event_to_response(event, rec)
+
+
+# ---------------------------------------------------------------------------
+# Routes — Transaction status (GET /transactions/{tx_id})
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/transactions/{tx_id}",
+    response_model=TransactionStatusResponse,
+    summary="Get transaction lifecycle status",
+    tags=["Transactions"],
+)
+async def get_transaction_status(tx_id: str):
+    """
+    Return the current lifecycle state of a transaction.
+
+    Use this to poll transaction status after submission.  The response
+    includes the full lifecycle record: state, node count, consensus outcome,
+    fault count, billing amount, and timestamps.
+    """
+    rec = _load_tx_record(tx_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Transaction {tx_id!r} not found")
+    return TransactionStatusResponse(
+        tx_id=rec.tx_id,
+        tenant_id=rec.tenant_id,
+        lifecycle_state=rec.state.value,
+        node_count=rec.node_count,
+        consensus_reached=rec.consensus_reached,
+        fault_count=rec.fault_count,
+        duration_ms=rec.duration_ms,
+        billed_amount=rec.billed_amount,
+        created_at=rec.created_at,
+        finalized_at=rec.finalized_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +682,33 @@ async def get_audit_summary():
 
 
 @app.get(
+    "/network/nodes/{node_id}/health",
+    summary="Node health status",
+    tags=["Network"],
+)
+async def get_node_health(node_id: str):
+    """
+    Return the current health state of a single node.
+
+    States: HEALTHY | SUSPECT | EXCLUDED | REHABILITATING
+
+    - **HEALTHY**: Node responds within expected latency bounds.
+    - **SUSPECT**: Node has had 3+ consecutive failures; still participating.
+    - **EXCLUDED**: Node has had 5+ consecutive failures; skipped in broadcast.
+    - **REHABILITATING**: Recently recovered from EXCLUDED; being re-admitted.
+
+    ``p95_latency_ms`` is the 95th-percentile observed latency over the last
+    20 responses — useful for detecting Byzantine timing attacks.
+    """
+    try:
+        registry = get_health_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    health = registry.get(node_id)
+    return health.to_dict()
+
+
+@app.get(
     "/audit/replay",
     summary="Full transaction replay log",
     tags=["Audit"],
@@ -505,7 +717,14 @@ async def get_replay():
     """
     Return the complete ordered list of transactions and their outcomes.
     Useful for replay viewers and dashboards.
+
+    Disabled when ``ECN_DEBUG=false`` (production mode).
     """
+    if os.environ.get("ECN_DEBUG", "true").lower() in ("false", "0", "no"):
+        raise HTTPException(
+            status_code=403,
+            detail="Replay endpoint is disabled in production mode (ECN_DEBUG=false)",
+        )
     audit = _require_audit()
     events = audit.get_events()
     return {
@@ -935,16 +1154,12 @@ async def revoke_api_key(key_id: str, _auth=Depends(require_admin())):
 )
 async def tenant_usage(tenant_id: str):
     """
-    Return the number of consensus rounds executed by this tenant in the
-    current billing period and all previous periods.
+    Return the number of RMAEs executed by this tenant in the current billing
+    period and all previous periods.
 
-    This endpoint powers the SaaS billing model:
     - ``current_period`` — the active billing period key (e.g. ``"2026-04"``)
-    - ``round_count``    — rounds executed in the current period
+    - ``round_count``    — RMAEs executed in the current period
     - ``all_periods``    — full billing history (period → count)
-
-    Wire ``round_count`` into your Stripe metered billing subscription to
-    charge per consensus round.
 
     Set ``ECN_BILLING_PERIOD=daily`` for per-day buckets (default: monthly).
     """
@@ -962,6 +1177,80 @@ async def tenant_usage(tenant_id: str):
 
     usage = tracker.get_usage(tenant_id)
     return UsageResponse(**usage)
+
+
+@app.get(
+    "/tenants/{tenant_id}/billing-ledger",
+    response_model=BillingLedgerResponse,
+    summary="Immutable billing ledger for this tenant",
+    tags=["Billing"],
+)
+async def tenant_billing_ledger(tenant_id: str):
+    """
+    Return the immutable, append-only billing ledger for this tenant.
+
+    Each entry represents one RMAE (Resolved Multi-Party Agreement Event)
+    with its node count, billed amount, and consensus outcome.  These records
+    are **never updated or deleted** — they are the financial source of truth
+    for dispute resolution.
+
+    If audit logs and billing entries diverge, this ledger takes precedence.
+    """
+    from ecn.tenant import get_tenant_registry
+    registry = get_tenant_registry()
+    if registry.get(tenant_id) is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id!r} not found")
+
+    from ecn.billing import get_tracker
+    try:
+        tracker = get_tracker()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    entries = tracker.get_billing_ledger(tenant_id)
+    total_billed = sum(e["billed_amount"] for e in entries)
+    return BillingLedgerResponse(
+        tenant_id=tenant_id,
+        entries=[BillingLedgerEntry(**e) for e in entries],
+        total_entries=len(entries),
+        total_billed=round(total_billed, 6),
+    )
+
+
+@app.get(
+    "/tenants/{tenant_id}/sla",
+    response_model=SLAResponse,
+    summary="SLA compliance and pricing tier for this tenant",
+    tags=["Billing"],
+)
+async def tenant_sla(tenant_id: str):
+    """
+    Return SLA compliance data and RMAE pricing for this tenant.
+
+    **Pricing tiers** (set ``ECN_PRICING_TIER`` environment variable):
+
+    | Tier     | SLA    | Quorum | Price/RMAE |
+    |----------|--------|--------|------------|
+    | basic    | 95%    | 0.51   | $0.001     |
+    | standard | 99%    | 0.67   | $0.005     |
+    | critical | 99.99% | 0.80   | $0.020     |
+
+    ``sla_met`` is ``true`` when the consensus rate in the current period
+    meets or exceeds the tier's SLA threshold.
+    """
+    from ecn.tenant import get_tenant_registry
+    registry = get_tenant_registry()
+    if registry.get(tenant_id) is None:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id!r} not found")
+
+    from ecn.billing import get_tracker
+    try:
+        tracker = get_tracker()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    sla = tracker.get_sla(tenant_id)
+    return SLAResponse(**sla)
 
 
 @app.post(

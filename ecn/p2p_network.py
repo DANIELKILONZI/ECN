@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 from ecn.node_server import NodeServer
@@ -58,6 +59,7 @@ from ecn.node import NodeResult
 from ecn.consensus import ConsensusResult, run_consensus, DEFAULT_QUORUM_THRESHOLD
 from ecn.crypto import public_key_from_hex, verify_result, SignedResult
 from ecn.execution_engine import Transaction, State
+from ecn.node_health import NodeHealthRegistry, NodeState, init_health_registry
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,7 @@ class P2PNetwork:
         audit_log=None,
         quorum_threshold: Optional[float] = None,
         min_responses: Optional[int] = None,
+        health_registry: Optional[NodeHealthRegistry] = None,
     ) -> None:
         self._servers = servers
         self.verbose = verbose
@@ -125,6 +128,10 @@ class P2PNetwork:
             s.node_id: s.public_key for s in servers
         }
         self._history: List[Tuple[Transaction, List[NodeResult], ConsensusResult]] = []
+        self._health: NodeHealthRegistry = health_registry or NodeHealthRegistry()
+        # Pre-register all servers with the health registry
+        for s in servers:
+            self._health.get(s.node_id)
 
     # ------------------------------------------------------------------
     # Factory
@@ -140,6 +147,7 @@ class P2PNetwork:
         audit_log=None,
         quorum_threshold: Optional[float] = None,
         min_responses: Optional[int] = None,
+        health_registry: Optional[NodeHealthRegistry] = None,
     ) -> "P2PNetwork":
         """
         Create and start all node servers, then return a connected P2PNetwork.
@@ -188,7 +196,17 @@ class P2PNetwork:
             audit_log=audit_log,
             quorum_threshold=quorum_threshold,
             min_responses=min_responses,
+            health_registry=health_registry,
         )
+
+    # ------------------------------------------------------------------
+    # Health registry access
+    # ------------------------------------------------------------------
+
+    @property
+    def health_registry(self) -> NodeHealthRegistry:
+        """Return the NodeHealthRegistry for this network."""
+        return self._health
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -210,17 +228,36 @@ class P2PNetwork:
         -------
         (results, consensus_result)
         """
-        tasks = [self._send_to_server(s, tx) for s in self._servers]
+        tasks = []
+        participating_servers = []
+        excluded_servers = []
+        for s in self._servers:
+            if self._health.get(s.node_id).state == NodeState.EXCLUDED:
+                excluded_servers.append(s)
+            else:
+                participating_servers.append(s)
+                tasks.append(self._send_to_server(s, tx))
+
         raw_responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: List[NodeResult] = []
         failed_nodes: List[str] = []
-        for server, resp in zip(self._servers, raw_responses):
+        for server, resp in zip(participating_servers, raw_responses):
             if isinstance(resp, Exception):
                 logger.warning("Server %s failed: %s", server.node_id, resp)
                 failed_nodes.append(server.node_id)
+                self._health.record_failure(server.node_id)
                 continue
-            results.append(resp)
+            node_result, latency_ms = resp
+            self._health.record_success(server.node_id, latency_ms=latency_ms)
+            results.append(node_result)
+
+        if excluded_servers:
+            logger.info(
+                "Adaptive quorum: skipping %d EXCLUDED nodes: %s",
+                len(excluded_servers),
+                [s.node_id for s in excluded_servers],
+            )
 
         if failed_nodes:
             logger.info(
@@ -230,6 +267,9 @@ class P2PNetwork:
                 failed_nodes,
             )
 
+        # Total denominator includes excluded nodes — quorum is checked against
+        # the full network size so InsufficientQuorumError fires when too many
+        # nodes are lost.
         if len(results) < self._min_responses:
             raise InsufficientQuorumError(
                 f"Only {len(results)}/{len(self._servers)} nodes responded "
@@ -272,6 +312,7 @@ class P2PNetwork:
         self, server: NodeServer, tx: Transaction
     ) -> NodeResult:
         """Open a TCP connection, send tx, read the signed result."""
+        t0 = time.monotonic()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(server.host, server.port),
             timeout=_CONNECT_TIMEOUT,
@@ -285,13 +326,15 @@ class P2PNetwork:
             if "error" in data:
                 raise RuntimeError(f"Node {server.node_id} returned error: {data['error']}")
 
-            return NodeResult(
+            latency_ms = (time.monotonic() - t0) * 1000.0
+            result = NodeResult(
                 node_id=data["node_id"],
                 state_hash=data["state_hash"],
                 result_state={},        # not transmitted over wire (saves bandwidth)
                 trace_entry={},
                 signature=data.get("signature"),
             )
+            return result, latency_ms
         finally:
             writer.close()
             try:

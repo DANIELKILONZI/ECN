@@ -373,10 +373,16 @@ async def tenant_submit_transaction(tenant_id: str, body: TenantTransactionReque
     if event is None:
         raise HTTPException(status_code=500, detail="Audit event not recorded")
 
-    # Record usage for SaaS billing
+    # Record usage for SaaS billing (writes to both counter store and immutable ledger)
     try:
+        import uuid as _uuid
         from ecn.billing import get_tracker
-        get_tracker().record_round(tenant_id)
+        get_tracker().record_round(
+            tenant_id=tenant_id,
+            tx_id=str(_uuid.uuid4()),
+            node_count=tenant.network.node_count(),
+            consensus_reached=cr.consensus_reached,
+        )
     except RuntimeError:
         pass  # billing tracker not initialised (e.g. in unit tests)
 
